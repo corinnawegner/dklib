@@ -177,13 +177,37 @@ def unmask_batch(
             logits_pre_pmf[illegal_tokens] = -1e10 # very small number, so that these tokens are never selected.
 
         # --- store top tokens ---
+        # --- store top tokens safely (move to CPU before writing) ---
         if top_token_ids is not None and top_token_probs is not None:
+            # ensure unmask_index is a Python int (masked_token_sub_inds is from torch.nonzero)
+            if isinstance(unmask_index, torch.Tensor):
+                # handle shapes like [1] or [1,1]
+                unmask_index_int = int(unmask_index.view(-1).item())
+            else:
+                unmask_index_int = int(unmask_index)
+
+            # compute probs & topk on the device of logits (likely CUDA)
             probs = logits_pre_pmf.softmax(0)
             sorted_probs, sorted_ids = torch.sort(probs, descending=True)
-            kept_ids = sorted_ids[:max_kept]
+            kept_ids = sorted_ids[:max_kept]        # tensor on same device as logits
             kept_probs = sorted_probs[:max_kept]
-            top_token_ids[0, unmask_index, :kept_ids.shape[0]] = kept_ids
-            top_token_probs[0, unmask_index, :kept_probs.shape[0]] = kept_probs
+
+            # move the kept results to CPU BEFORE assigning into CPU storage
+            kept_ids_cpu = kept_ids.detach().cpu()
+            kept_probs_cpu = kept_probs.detach().cpu()
+
+            # top_token_ids/top_token_probs expected shape: [max_masks, max_kept] on CPU
+            # use unmask_index_int to index the mask position
+            top_token_ids[unmask_index_int, : kept_ids_cpu.shape[0]] = kept_ids_cpu
+            top_token_probs[unmask_index_int, : kept_probs_cpu.shape[0]] = kept_probs_cpu
+
+            # cleanup temporaries to reduce GPU pressure
+            del kept_ids, kept_probs, kept_ids_cpu, kept_probs_cpu, probs, sorted_probs, sorted_ids
+            # optionally free GPU cache; useful if memory is tight
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 
         if(T == 0):
@@ -352,12 +376,22 @@ def mask_unmask_monte_sequential(
     # Optional top token storage
     top_token_ids = None
     top_token_probs = None
-    device = pipeline.device
+    
     if return_top_tokens:
-        top_token_ids = torch.zeros((sequential_iterations, maximum_number_of_masks, max_kept),
-                                    dtype=torch.long, device=device)
-        top_token_probs = torch.zeros((sequential_iterations, maximum_number_of_masks, max_kept),
-                                    dtype=torch.float32, device=device)
+        # Store results on CPU to avoid GPU memory accumulation
+        # shape: (iterations, masked_positions, top_candidates)
+        top_token_ids = torch.zeros(
+            (sequential_iterations, maximum_number_of_masks, max_kept),
+            dtype=torch.long,
+            device='cpu'
+        )
+        top_token_probs = torch.zeros(
+            (sequential_iterations, maximum_number_of_masks, max_kept),
+            dtype=torch.float32,
+            device='cpu'
+        )
+
+
 
     for i in range(sequential_iterations):
         # slice to maintain batch dimension
