@@ -2,7 +2,12 @@ import transformers
 import torch
 from typing import Optional, Union, Literal
 
-UnmaskMode = Literal["classic", "dream"]
+from .dream_helper import (
+    unmask_batch_dream,
+    fill_unmask_steps_from_history,
+    diffusion_generate_infilling,
+    CustomUnmasker,
+)
 
 def _unmask_dispatch(
     masked_token_tensor: torch.LongTensor,
@@ -11,18 +16,28 @@ def _unmask_dispatch(
     pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
     rng: Optional[torch.Generator],
     *,
-    mode: UnmaskMode,
     substitution_step: Optional[int] = None,
     T: float = 1.0,
     dont_predict_special_tokens: bool = True,
     max_kept: int = 100,
     top_token_ids: Optional[torch.LongTensor] = None,
     top_token_probs: Optional[torch.Tensor] = None,
+    mask_frac: Optional[float] = None,
 ):
     """
     Unified unmasking entrypoint.
     """
-    if mode == "classic":
+
+    if pipeline.model_name.startswith("Dream-org/Dream"):
+        return unmask_batch_dream(
+            masked_token_tensor,
+            attention_tensor,
+            substitutions,
+            pipeline,
+            mask_frac=mask_frac,
+        )
+
+    else:
         assert substitution_step is not None
         return unmask_batch(
             masked_token_tensor,
@@ -36,18 +51,8 @@ def _unmask_dispatch(
             max_kept=max_kept,
             top_token_ids=top_token_ids,
             top_token_probs=top_token_probs,
-        )
+            )
 
-    elif mode == "dream":
-        return unmask_batch_dream(
-            masked_token_tensor,
-            attention_tensor,
-            substitutions,
-            pipeline,
-        )
-
-    else:
-        raise ValueError(f"Unknown unmask mode: {mode}")
 
 def prepare_masked_batch(
     texts: list[str],
@@ -65,7 +70,7 @@ def prepare_masked_batch(
     # --- ensure special tokens exist (Dream expects them) ---
     assert tokenizer.bos_token_id is not None, "Tokenizer must define BOS token"
     assert tokenizer.eos_token_id is not None, "Tokenizer must define EOS token"
-
+    
     # --- disallowed tokens (never masked) ---
     if disallowed_ids is None:
         disallowed_ids = []
@@ -242,8 +247,6 @@ def unmask_batch(
         ] = new_token_id  # performing the substitution
         substitutions[sent_ind, unmask_index, 3] = substitution_step
 
-
-
 def apply_substitutions(
     token_tensor: torch.LongTensor, substitutions: torch.LongTensor, state="final", sequential=False
 ) -> None:
@@ -291,7 +294,6 @@ def mask_unmask_monte_batch(
     num_masks: Union[int, float],
     rng: torch.Generator,
     *,
-    mode: UnmaskMode = "classic",
     T: float = 1.0,
     return_tokens: bool = False,
     return_top_tokens: bool = False,
@@ -305,7 +307,7 @@ def mask_unmask_monte_batch(
 
     top_token_ids = None
     top_token_probs = None
-    if return_top_tokens and mode == "classic":
+    if return_top_tokens and not pipeline.model_name.startswith("Dream-org/Dream"):
         top_token_ids = torch.zeros(
             (batch_size, max_masks, max_kept),
             dtype=torch.long,
@@ -317,7 +319,7 @@ def mask_unmask_monte_batch(
             device=pipeline.device,
         )
 
-    if mode == "classic":
+    if not pipeline.model_name.startswith("Dream-org/Dream"):
         for step in range(max_masks):
             _unmask_dispatch(
                 masked_token_tensor,
@@ -331,9 +333,10 @@ def mask_unmask_monte_batch(
                 max_kept=max_kept,
                 top_token_ids=top_token_ids,
                 top_token_probs=top_token_probs,
+                mask_frac=num_masks if num_masks < 1 else None,
             )
 
-    elif mode == "dream":
+    elif pipeline.model_name.startswith("Dream-org/Dream"):
         _unmask_dispatch(
             masked_token_tensor,
             attention_tensor,
@@ -346,7 +349,7 @@ def mask_unmask_monte_batch(
     outputs = [substitutions]
     if return_tokens:
         outputs.append(masked_token_tensor)
-    if return_top_tokens and mode == "classic":
+    if return_top_tokens and not pipeline.model_name.startswith("Dream-org/Dream"):
         outputs.append((top_token_ids, top_token_probs))
 
     return tuple(outputs)
@@ -358,7 +361,6 @@ def mask_unmask_monte_sequential(
     num_masks: Union[int, float],
     rng: torch.Generator,
     *,
-    mode: UnmaskMode = "classic",
     T: float = 1.0,
     return_tokens: bool = False,
 ):
@@ -377,7 +379,7 @@ def mask_unmask_monte_sequential(
         step_att = attention_tensor[i:i+1]
         step_subs = substitutions[i:i+1]
 
-        if mode == "classic":
+        if not pipeline.model_name.startswith("Dream-org/Dream"):
             for step in range(max_masks):
                 _unmask_dispatch(
                     step_tokens,
@@ -385,7 +387,6 @@ def mask_unmask_monte_sequential(
                     step_subs,
                     pipeline,
                     rng,
-                    mode="classic",
                     substitution_step=step,
                     T=T,
                 )
@@ -395,8 +396,7 @@ def mask_unmask_monte_sequential(
                 step_att,
                 step_subs,
                 pipeline,
-                rng=None,
-                mode="dream",
+                rng,
             )
 
         substitutions[i] = step_subs[0]
