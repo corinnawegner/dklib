@@ -1,8 +1,8 @@
 import types
 import torch
-from typing import Optional
+from typing import Optional, Union, Set
 import transformers
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 
 class CustomUnmasker:
     def __init__(self, model_name: str, device: int = 0, dtype=torch.bfloat16):
@@ -62,7 +62,6 @@ def diffusion_generate_infilling(
         has_default_max_length=has_default_max_length,
         input_ids_length=input_ids_length,
     )
-    
     # we allow the max length to be exactly the input length, ignoring a valueerror and warning that this can lead to unexpected behaviour.
     #self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
 
@@ -80,6 +79,7 @@ def diffusion_generate_infilling(
             pad_mask = torch.ones((attention_mask.size(0), pad_len), dtype=attention_mask.dtype, device=device)
             attention_mask = torch.cat([attention_mask, pad_mask], dim=-1)
 
+
     # skip expand — we want single completion
     result = self._sample(
         input_ids,
@@ -90,71 +90,6 @@ def diffusion_generate_infilling(
     )
 
     return result
-
-def unmask_batch_dream(
-    masked_token_tensor: torch.LongTensor,
-    attention_tensor: torch.Tensor,
-    substitutions_old: torch.LongTensor,
-    pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
-    mask_frac: float = 0.5,
-):
-    """
-    Dream unmasking with BERT-compatible substitutions.
-    """
-    model = pipeline.model
-    tok = pipeline.tokenizer
-    device = masked_token_tensor.device
-
-    # Bind custom diffusion method
-    model.diffusion_generate_infilling = types.MethodType(
-        diffusion_generate_infilling, model
-    )
-
-    # --- reconstruct ORIGINAL tokens (before masking) ---
-    # substitutions_old[:, :, 1] stores true originals
-    original_tokens = masked_token_tensor.clone()
-    for b in range(substitutions_old.shape[0]):
-        mask = substitutions_old[b, :, 0] >= 0
-        pos = substitutions_old[b, mask, 0]
-        vals = substitutions_old[b, mask, 1]
-        original_tokens[b, pos] = vals
-
-    # Safety: never pass negatives to Dream
-    masked_token_tensor = masked_token_tensor.clone()
-    masked_token_tensor[masked_token_tensor < 0] = tok.mask_token_id
-
-    # --- run Dream diffusion ---
-    output = model.diffusion_generate_infilling(
-        token_tensor=masked_token_tensor,
-        attention_mask=attention_tensor,
-        max_length=masked_token_tensor.shape[1],
-        output_history=True,
-        return_dict_in_generate=True,
-        steps=512, #int(mask_frac * masked_token_tensor.shape[1]),
-        temperature=0.2,
-        top_p=0.95,
-        alg="entropy",
-        alg_temp=0.0,
-    )
-
-    final_tokens = output.sequences[:, :masked_token_tensor.shape[1]].clone()
-
-    # --- build BERT-compatible substitutions ---
-    substitutions_new = build_dream_substitutions(
-        original_tokens=original_tokens,
-        masked_tokens=masked_token_tensor,
-        final_tokens=final_tokens,
-        history=output.history,
-        mask_token_id=tok.mask_token_id,
-        device=device,
-    )
-
-    # Update token tensor in place
-    masked_token_tensor[:] = final_tokens
-
-    return masked_token_tensor, substitutions_new
-
-
 
 
 def fill_unmask_steps_from_history(output, original_tokens, device):
@@ -383,3 +318,68 @@ def build_dream_substitutions(
             substitutions[b, j, 3] = step
 
     return substitutions
+def unmask_batch_dream(
+    masked_token_tensor: torch.LongTensor,          # [num_runs, seq_len]
+    attention_tensor: torch.Tensor,                 # [num_runs, seq_len]
+    substitutions_old: torch.LongTensor,           # [num_runs, max_masks, 4]
+    pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
+    mask_frac: float = 0.5,
+):
+    """
+    Dream unmasking with BERT-compatible substitutions, sequential-safe.
+    """
+    model = pipeline.model
+    tok = pipeline.tokenizer
+    device = masked_token_tensor.device
+
+    # Bind custom diffusion method
+    model.diffusion_generate_infilling = types.MethodType(
+        diffusion_generate_infilling, model
+    )
+
+    batch_size, seq_len = masked_token_tensor.shape
+
+    # --- reconstruct ORIGINAL tokens (before masking) ---
+    original_tokens = masked_token_tensor.clone()
+    for b in range(batch_size):
+        mask = substitutions_old[b, :, 0] >= 0
+        pos = substitutions_old[b, mask, 0].long()
+        vals = substitutions_old[b, mask, 1]
+        for i, p in enumerate(pos):
+            if p < seq_len:
+                original_tokens[b, p] = vals[i]
+
+    # Safety: never pass negatives to Dream
+    masked_token_tensor = masked_token_tensor.clone()
+    masked_token_tensor[masked_token_tensor < 0] = tok.mask_token_id
+
+    # --- run Dream diffusion ---
+    output = model.diffusion_generate_infilling(
+        token_tensor=masked_token_tensor,
+        attention_mask=attention_tensor,
+        max_length=seq_len,
+        output_history=True,
+        return_dict_in_generate=True,
+        steps=512,#max(1, int(mask_frac * seq_len)),  # ensure at least 1 step
+        temperature=0.2,
+        top_p=0.95,
+        alg="entropy",
+        alg_temp=0.0,
+    )
+
+    final_tokens = output.sequences[:, :seq_len].clone()
+
+    # --- build BERT-compatible substitutions ---
+    substitutions_new = build_dream_substitutions(
+        original_tokens=original_tokens,
+        masked_tokens=masked_token_tensor,
+        final_tokens=final_tokens,
+        history=output.history,
+        mask_token_id=tok.mask_token_id,
+        device=device,
+    )
+
+    # Update token tensor in place
+    masked_token_tensor[:] = final_tokens
+
+    return masked_token_tensor, substitutions_new

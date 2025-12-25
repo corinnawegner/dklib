@@ -26,20 +26,23 @@ def _unmask_dispatch(
 ):
     """
     Unified unmasking entrypoint.
+    ALWAYS returns `substitutions`.
     """
 
     if pipeline.model_name.startswith("Dream-org/Dream"):
-        return unmask_batch_dream(
+        # Dream helper returns (tokens, substitutions)
+        _, substitutions = unmask_batch_dream(
             masked_token_tensor,
             attention_tensor,
             substitutions,
             pipeline,
             mask_frac=mask_frac,
         )
+        return substitutions
 
     else:
         assert substitution_step is not None
-        return unmask_batch(
+        unmask_batch(
             masked_token_tensor,
             attention_tensor,
             substitutions,
@@ -51,7 +54,8 @@ def _unmask_dispatch(
             max_kept=max_kept,
             top_token_ids=top_token_ids,
             top_token_probs=top_token_probs,
-            )
+        )
+        return substitutions
 
 
 def prepare_masked_batch(
@@ -61,7 +65,7 @@ def prepare_masked_batch(
     tokenizer: transformers.tokenization_utils_fast.PreTrainedTokenizerFast,
     device: torch.device,
     disallowed_ids: Optional[list[int]] = None,
-) -> tuple[torch.LongTensor, torch.Tensor]:
+):
     """
     Takes a list of strings, tokenizes them (with BOS/EOS),
     and masks a random subset of *non-special* tokens.
@@ -327,7 +331,6 @@ def mask_unmask_monte_batch(
                 substitutions,
                 pipeline,
                 rng,
-                mode="classic",
                 substitution_step=step,
                 T=T,
                 max_kept=max_kept,
@@ -343,7 +346,7 @@ def mask_unmask_monte_batch(
             substitutions,
             pipeline,
             rng=None,
-            mode="dream",
+
         )
 
     outputs = [substitutions]
@@ -357,29 +360,51 @@ def mask_unmask_monte_batch(
 def mask_unmask_monte_sequential(
     text: str,
     sequential_iterations: int,
-    pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
-    num_masks: Union[int, float],
-    rng: torch.Generator,
+    pipeline,
+    num_masks,
+    rng,
     *,
     T: float = 1.0,
-    return_tokens: bool = False,
 ):
+    # --- prepare ONE masked sentence ---
     masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch(
-        [text] * sequential_iterations,
+        [text],
         num_masks,
         rng,
         pipeline.tokenizer,
         pipeline.device,
     )
 
+    print("Substitutions after masking:", substitutions.shape) #1, 189,4 .. but why?
     max_masks = substitutions.shape[1]
 
-    for i in range(sequential_iterations):
-        step_tokens = masked_token_tensor[i:i+1]
-        step_att = attention_tensor[i:i+1]
-        step_subs = substitutions[i:i+1]
+    # ✅ PREALLOCATE [U, M, 4]
+    all_substitutions = torch.full(
+        (sequential_iterations, max_masks, 4),
+        -1,
+        dtype=torch.long,
+        device=pipeline.device,
+    )
 
-        if not pipeline.model_name.startswith("Dream-org/Dream"):
+    #print("all_substitutions shape:", all_substitutions.shape)
+    for uturn in range(sequential_iterations):
+        # For each uturn, we need to unmask the previously masked tokens, fill in the substitutions, and then re-mask for the next uturn.
+
+        step_tokens = masked_token_tensor
+        step_att = attention_tensor
+        step_subs = substitutions.clone()   # [1, M, 4]
+
+        # --- unmask ---
+        if pipeline.model_name.startswith("Dream-org/Dream"):
+            print("Using Dream unmasking...")
+            step_subs = _unmask_dispatch(
+                step_tokens,
+                step_att,
+                step_subs,
+                pipeline,
+                rng=None,
+            )
+        else:
             for step in range(max_masks):
                 _unmask_dispatch(
                     step_tokens,
@@ -390,29 +415,25 @@ def mask_unmask_monte_sequential(
                     substitution_step=step,
                     T=T,
                 )
-        else:
-            _unmask_dispatch(
-                step_tokens,
-                step_att,
-                step_subs,
-                pipeline,
-                rng,
-            )
 
-        substitutions[i] = step_subs[0]
-        masked_token_tensor[i] = step_tokens[0]
+        #print("Substitutions after unmasking:", step_subs.shape) # torch.Size([1, 189, 4])
+        #apply_substitutions(step_tokens, step_subs, state="final")
 
-        apply_substitutions(step_tokens, step_subs, state="final")
+        # ✅ STORE THIS U-TURN
+        all_substitutions[uturn] = step_subs[0] # Maybe here is the error?
 
-        if i + 1 < sequential_iterations:
-            masked_token_tensor[i + 1] = step_tokens[0]
-            mask = substitutions[i + 1, :, 0] >= 0
-            masked_token_tensor[i + 1, substitutions[i + 1, mask, 0]] = (
-                pipeline.tokenizer.mask_token_id
-            )
-            substitutions[i + 1, mask, 1] = step_tokens[0, substitutions[i + 1, mask, 0]]
+        # --- re-mask for next u-turn ---
+        if uturn + 1 < sequential_iterations:
+            mask = step_subs[0, :, 0] >= 0
+            positions = step_subs[0, mask, 0]
+            masked_token_tensor[0, positions] = pipeline.tokenizer.mask_token_id
 
-    return (substitutions, masked_token_tensor) if return_tokens else substitutions
+            substitutions = step_subs.clone()
+            substitutions[0, mask, 1] = step_tokens[0, positions]
+
+    #print("shape of substitutions after mask_unmask_monte_sequential:", all_substitutions.shape) # torch.Size([10, 189, 4])
+
+    return all_substitutions
 
 
 def reconstruct_sequential_tensor_texts(initial_text, substitutions, pipeline):
