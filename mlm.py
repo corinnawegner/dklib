@@ -138,9 +138,23 @@ def prepare_masked_batch(
         if n_masks == 0:
             continue
 
-        allowed_tokens_mask = ~torch.isin(
-            token_tensor[sentence_ind], disallowed_ids
-        )
+    # --- base disallowed by token id ---
+    allowed_tokens_mask = ~torch.isin(
+        token_tensor[sentence_ind], disallowed_ids
+    )
+
+    # --- additionally disallow first and last *valid* tokens ---
+    valid_positions = torch.nonzero(
+        attention_tensor[sentence_ind] > 0, as_tuple=False
+    ).squeeze(-1)
+
+    if valid_positions.numel() >= 2:
+        first_pos = valid_positions[0]
+        last_pos = valid_positions[-1]
+
+        allowed_tokens_mask[first_pos] = False
+        allowed_tokens_mask[last_pos] = False
+
         indices = torch.nonzero(allowed_tokens_mask, as_tuple=False).squeeze(-1)
 
         subs_inds = torch.arange(n_masks, device=device)

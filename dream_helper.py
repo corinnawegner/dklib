@@ -4,6 +4,7 @@ from typing import Optional, Union, Set
 import transformers
 from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 
+
 class CustomUnmasker:
     def __init__(self, model_name: str, device: int = 0, dtype=torch.bfloat16):
         self._remote_code = True
@@ -318,6 +319,7 @@ def build_dream_substitutions(
             substitutions[b, j, 3] = step
 
     return substitutions
+
 def unmask_batch_dream(
     masked_token_tensor: torch.LongTensor,          # [num_runs, seq_len]
     attention_tensor: torch.Tensor,                 # [num_runs, seq_len]
@@ -328,9 +330,17 @@ def unmask_batch_dream(
     """
     Dream unmasking with BERT-compatible substitutions, sequential-safe.
     """
-    model = pipeline.model
     tok = pipeline.tokenizer
+    model = pipeline.model
     device = masked_token_tensor.device
+
+    # 🚫 compute banned token IDs ONCE
+    if not hasattr(pipeline, "_banned_ids"):
+        pipeline._banned_ids = compute_banned_token_ids(tok)
+
+    banned_ids = pipeline._banned_ids
+    logits_hook = make_ban_tokens_logits_hook(banned_ids)
+
 
     # Bind custom diffusion method
     model.diffusion_generate_infilling = types.MethodType(
@@ -365,6 +375,7 @@ def unmask_batch_dream(
         top_p=0.95,
         alg="entropy",
         alg_temp=0.0,
+        generation_logits_hook_func=logits_hook,
     )
 
     final_tokens = output.sequences[:, :seq_len].clone()
@@ -383,3 +394,62 @@ def unmask_batch_dream(
     masked_token_tensor[:] = final_tokens
 
     return masked_token_tensor, substitutions_new
+
+def compute_banned_token_ids(
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    allow_numbers: bool = False,
+    allow_newlines: bool = False,
+    allowed_symbols: Optional[Set[str]] = None,
+    ban_special_tokens: bool = True,
+) -> torch.LongTensor:
+    """
+    Scan tokenizer vocabulary and return token IDs that should be banned
+    during generation (non-prose tokens + optionally special tokens).
+
+    Rules:
+      - Newlines banned by default
+      - Numbers banned by default
+      - Code / non-prose symbols banned
+      - Special tokens always banned (recommended)
+
+    Returns:
+        torch.LongTensor of banned token IDs
+    """
+
+    if allowed_symbols is None:
+        # Standard English punctuation we allow
+        allowed_symbols = {
+            ".", ",", "!", "?", "'", '"', ";", ":", "-", "(", ")", " "
+        }
+
+    banned_ids: Set[int] = set()
+    vocab_size = len(tokenizer)
+
+    for token_id in range(vocab_size):
+        token_str = tokenizer.decode([token_id], skip_special_tokens=False)
+
+        # --- RULE 1: BAN NEWLINES ---
+        if not allow_newlines and ("\n" in token_str or "\r" in token_str):
+            banned_ids.add(token_id)
+            continue
+
+        # --- RULE 2: BAN NUMBERS ---
+        if not allow_numbers and any(c.isdigit() for c in token_str):
+            banned_ids.add(token_id)
+            continue
+
+        # --- RULE 3: BAN CODE / NON-PROSE SYMBOLS ---
+        for char in token_str:
+            if not char.isalpha() and char not in allowed_symbols:
+                banned_ids.add(token_id)
+                break
+
+    # --- RULE 4: BAN SPECIAL TOKENS (CRITICAL) ---
+    if ban_special_tokens:
+        banned_ids.update(tokenizer.all_special_ids)
+
+    banned_ids = torch.tensor(sorted(banned_ids), dtype=torch.long)
+
+    print(f"Banned {len(banned_ids)} tokens (non-prose + special).")
+    return banned_ids
