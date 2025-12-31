@@ -31,14 +31,14 @@ def _unmask_dispatch(
 
     if pipeline.model_name.startswith("Dream-org/Dream"):
         # Dream helper returns (tokens, substitutions)
-        _, substitutions = unmask_batch_dream(
+        new_tokens, substitutions = unmask_batch_dream(
             masked_token_tensor,
             attention_tensor,
             substitutions,
             pipeline,
             mask_frac=mask_frac,
         )
-        return substitutions
+        return new_tokens, substitutions
 
     else:
         assert substitution_step is not None
@@ -57,7 +57,6 @@ def _unmask_dispatch(
         )
         return substitutions
 
-
 def prepare_masked_batch(
     texts: list[str],
     num_masks: Union[int, float],
@@ -65,41 +64,48 @@ def prepare_masked_batch(
     tokenizer: transformers.tokenization_utils_fast.PreTrainedTokenizerFast,
     device: torch.device,
     disallowed_ids: Optional[list[int]] = None,
-):
-    """
-    Takes a list of strings, tokenizes them (with BOS/EOS),
-    and masks a random subset of *non-special* tokens.
-    """
+) -> tuple[torch.LongTensor, torch.Tensor]:
+    """_summary_
+    Takes a list of strings, tokenizes them, and for each one, masks a random subset of the tokens.
 
-    # --- ensure special tokens exist (Dream expects them) ---
-    assert tokenizer.bos_token_id is not None, "Tokenizer must define BOS token"
-    assert tokenizer.eos_token_id is not None, "Tokenizer must define EOS token"
-    
-    # --- disallowed tokens (never masked) ---
+    Args:
+        texts (list[str]): A list of texts on which to perform masking.
+        num_masks (Union[int,float]): The number of tokens to substitute with masks. If a float p between 0,1 is given, then masking is done with probability p.
+        rng (torch.Generator): A random number generator for selecting the tokens to mask.
+        tokenizer (transformers.tokenization_utils_fast.PreTrainedTokenizerFast): The text tokenizer.
+        device (torch.device): which device to store the tokenized tensors on.
+        disallowed_ids (Optional[list[int]], optional): A list of additional tokens to ignore -- special tokens are always ignored. Defaults to None.
+
+    Returns:
+        tuple[torch.LongTensor, torch.Tensor, torch.LongTensor]: Returns the token id tensor and attention mask, with shapes [batch size x longest sentence], [batch size x longest sentence], and [batch size x longest sentence x 4].
+        Substitutions tensor has the following format:
+        (i,j,0) = in sentence i, mask number j, which token in the sentence was masked
+        (i,j,1) = what was the original token?
+        (i,j,2) = -1, but will be used to track final token choice.
+        (i,j,3) = -1 but will be used later to track when this mask token was unmasked.
+
+    """
+    # Tokens we are not allowed to convert to <mask>!
     if disallowed_ids is None:
         disallowed_ids = []
-
-    # explicitly include BOS/EOS/PAD/MASK/etc.
-    disallowed_ids = (
-        disallowed_ids
-        + tokenizer.all_special_ids
-        + [tokenizer.bos_token_id, tokenizer.eos_token_id]
-    )
-
+    disallowed_ids += (
+        tokenizer.all_special_ids
+    )  # [tokenizer.pad_token_id, tokenizer.bos_token_id, tokenizer.eos_token_id]
     disallowed_ids = torch.tensor(
         disallowed_ids, dtype=torch.int64, device=device
     ).unique()
 
+    # for each row, generate a set of legal tokens to mask.
+    # for each row, use rng.choice to choose the appropriate indices to mask.
+    # mask those tokens, noting the substitutions made.
+    # substitutions should be a [batch_size x num_masks x 3] tensor
+    # (i,j,0) = in sentence i, mask # j, which token in the sentence was masked
+    # (i,j,1) = what was the original token?
+    # (i,j,2) = -1, but will be used to track final token choice.
+
     mask_id = tokenizer.mask_token_id
 
-    # --- tokenize WITH special tokens ---
-    tokenized = tokenizer(
-        texts,
-        padding=True,
-        add_special_tokens=True,
-        return_attention_mask=True,
-    )
-
+    tokenized = tokenizer(texts, padding=True)
     token_tensor = torch.tensor(
         tokenized["input_ids"], dtype=torch.int64, device=device
     )
@@ -107,57 +113,52 @@ def prepare_masked_batch(
         tokenized["attention_mask"], dtype=torch.float32, device=device
     )
 
+    # I will iterate over all of the sentences, because I do not know that the number of allowed tokens in each sentece will be the same
+    # This complicates the use of rng.choice(num_allowed_tokens, num_masked, False)
     batch_size = len(texts)
 
-    # --- decide number of masks per sentence ---
+    # now, we need to decide the number of masks for each text.
     num_masks_sent = torch.zeros(batch_size, dtype=torch.int64, device=device)
-
     if num_masks > 1:
         num_masks = int(num_masks)
-
-    if isinstance(num_masks, int):
+    if type(num_masks) == int:
         num_masks_sent[:] = num_masks
     else:
         mask_probability = torch.tensor(num_masks, device=device).float()
         num_masks_sent[:] = torch.sum(
-            ~torch.isin(token_tensor, disallowed_ids), dim=1
-        )
+            ~torch.isin(token_tensor[:, :], disallowed_ids), axis=1
+        )  # count the number of tokens that are allowed to be masked.
+        # print('test: ', torch.binomial(num_masks_sent.float(),mask_probability,generator=rng))
         num_masks_sent[:] = torch.binomial(
             num_masks_sent.float(), mask_probability, generator=rng
         ).long()
 
     substitutions = torch.zeros(
-        (batch_size, torch.max(num_masks_sent), 4),
-        dtype=torch.int64,
-        device=device,
+        (batch_size, torch.max(num_masks_sent), 4), dtype=torch.int64, device=device
     )
-    substitutions[:, :, 0] = -1
-
+    substitutions[:, :, 0] = (
+        -1
+    )  # to deal with the fact that there may be different numbers of tokens to mask in each sentence, we will substitution rounds with nothing to be -1.
     for sentence_ind in range(batch_size):
-        n_masks = num_masks_sent[sentence_ind]
-        if n_masks == 0:
+        num_masks = num_masks_sent[sentence_ind]
+        if num_masks == 0:
             continue
-
-    # --- base disallowed by token id ---
-    allowed_tokens_mask = ~torch.isin(
-        token_tensor[sentence_ind], disallowed_ids
-    )
-
-    # --- additionally disallow first and last *valid* tokens ---
-    valid_positions = torch.nonzero(
-        attention_tensor[sentence_ind] > 0, as_tuple=False
-    ).squeeze(-1)
-
-    if valid_positions.numel() >= 2:
-        first_pos = valid_positions[0]
-        last_pos = valid_positions[-1]
-
-        allowed_tokens_mask[first_pos] = False
-        allowed_tokens_mask[last_pos] = False
-
+        allowed_tokens_mask = ~torch.isin(token_tensor[sentence_ind, :], disallowed_ids)
         indices = torch.nonzero(allowed_tokens_mask, as_tuple=False).squeeze(-1)
 
-        subs_inds = torch.arange(n_masks, device=device)
+        # forbid first and last valid token
+        if indices.numel() >= 3:
+            indices = indices[1:-1]
+        else:
+            # not enough tokens to safely mask anything
+            continue
+
+        num_masks = min(num_masks, indices.numel())
+        if num_masks == 0:
+            continue
+
+        # print(indices.shape[0], rng,device)
+        subs_inds = torch.arange(num_masks, device=device)
         token_indices_to_mask, _ = torch.sort(
             indices[
                 torch.randperm(indices.shape[0], generator=rng, device=device)[
@@ -165,18 +166,21 @@ def prepare_masked_batch(
                 ]
             ]
         )
-
-        substitutions[sentence_ind, subs_inds, 0] = token_indices_to_mask
-        substitutions[sentence_ind, subs_inds, 1] = token_tensor[
-            sentence_ind, token_indices_to_mask
-        ]
-
+        # print("num masks: ", num_masks)
+        # print("allowed tokens mask: ", allowed_tokens_mask)
+        # print("token indices to mask: ", token_indices_to_mask)
+        substitutions[sentence_ind, subs_inds, 0] = (
+            token_indices_to_mask  # what are the token indices in the original sentence that we are masking?
+        )
+        substitutions[sentence_ind, subs_inds, 1] = torch.gather(
+            token_tensor[sentence_ind, :], 0, token_indices_to_mask
+        )  # what are the original token ids ?
         token_tensor[sentence_ind, token_indices_to_mask] = mask_id
 
     substitutions[:, :, 2] = -1
     substitutions[:, :, 3] = -1
-
     return token_tensor, attention_tensor, substitutions
+
 
 def unmask_batch(
     masked_token_tensor: torch.LongTensor,
@@ -215,7 +219,7 @@ def unmask_batch(
     for sent_ind in range(batch_size):
         # print('starting sentence: ', sent_ind)
         masked_token_sub_inds = torch.nonzero(
-            (substitutions[sent_ind, :, 2] == -1) & (substitutions[sent_ind, :, 0] >= 0)
+            (substitutions[sent_ind, :, 2] == -1) & (substitutions[sent_ind, :, 0] >= 0) #extract masked token positions by checking where we have final id = -1 and position not -1
         )
         # print('mask of permitted substitutions: ', (substitutions[sent_ind, :, 2] == -1) & (substitutions[sent_ind,:,0] >= 0))
         # print('masked token sub inds: ',masked_token_sub_inds)
@@ -223,7 +227,7 @@ def unmask_batch(
             # then, there are no masked tokens remaining in the sentence, and we should continue with another sentence.
             # print(sent_ind, "skipping sentence!")
             continue
-        unmask_index = masked_token_sub_inds[
+        unmask_index = masked_token_sub_inds[ # pick a random position for unmasking
             torch.randint(
                 0,
                 masked_token_sub_inds.shape[0],
@@ -260,26 +264,29 @@ def unmask_batch(
             new_token_id = torch.multinomial(
                 new_token_pmf, 1, False, generator=rng
             )  # sampling a single token
-        masked_token_tensor[sent_ind, token_index_in_sent] = substitutions[
+        masked_token_tensor[sent_ind, token_index_in_sent] = substitutions[ # updating masked token tensor in place
             sent_ind, unmask_index, 2
         ] = new_token_id  # performing the substitution
-        substitutions[sent_ind, unmask_index, 3] = substitution_step
+        substitutions[sent_ind, unmask_index, 3] = substitution_step # updating substitution tensor with the unmasking step, not with the final token yet!!
 
 def apply_substitutions(
     token_tensor: torch.LongTensor, substitutions: torch.LongTensor, state="final", sequential=False
 ) -> None:
     """Applies the mask-unmask substitutions to a token tensor, for instance to see the final text.
+        Takes the information from the substitutions tensor and updates the token_tensor.
 
     Args:
         token_tensor (torch.LongTensor): The token tensor to be transformed, representing the initial input sentences.
-        substitutions (torch.LongTensor): The substitution record tensor
+        substitutions (torch.LongTensor): The substitution record tensor, shape [num_uturns or num_sents, num_masks, 4]
         state (str): One of 'final' or 'original' -- whether to restor the token tensor to the original state, or to apply the given substitutions.
+    Returns:
+        None: The token_tensor is modified in place.
     """
     assert (
         token_tensor.shape[0] == substitutions.shape[0]
     )  # ensure the batch sizes are the same.
     assert state in {"final", "original"}
-    substitution_index = 2 if state == "final" else 1
+    substitution_index = 2 if state == "final" else 1 # Is the token_tensor in the state before or after the mask-unmask step?
 
     if not sequential: 
         batch_indices = torch.arange(
@@ -293,13 +300,13 @@ def apply_substitutions(
         valid_token_indices = substitutions[:, :, 0][mask]
         valid_substitution_values = substitutions[:, :, substitution_index][mask]
         token_tensor[valid_batch_indices, valid_token_indices] = valid_substitution_values
-    else: 
+    else:  #Substitutions case
         # in the sequential case, we have to do this one sentence at a time, because each sentence may have a different number of substitutions.
         for sent_ind in range(token_tensor.shape[0]):
-            mask = substitutions[sent_ind,:,0] >= 0
-            token_indices = substitutions[sent_ind, :, 0][mask]
-            substitution_values = substitutions[sent_ind, :, substitution_index][mask]
-            token_tensor[sent_ind, token_indices] = substitution_values
+            mask = substitutions[sent_ind,:,0] >= 0 # determine which tokens have been masked
+            token_indices = substitutions[sent_ind, :, 0][mask] # take the token positions of the masked tokens
+            substitution_values = substitutions[sent_ind, :, substitution_index][mask] # If 'final', take the token ids after unmasking, if 'original', take the token ids before masking
+            token_tensor[sent_ind, token_indices] = substitution_values # Fill the token tensor at the positions where the tokens have been masked (final) or will be masked (original)
             token_tensor[sent_ind+1:, token_indices] = substitutions[sent_ind, :, 2][mask] #making sure we update all the later sentences to reflect the changes made so far.
 
     # batch_size = token_tensor.shape[0]
@@ -380,41 +387,46 @@ def mask_unmask_monte_sequential(
     *,
     T: float = 1.0,
 ):
-    # --- prepare ONE masked sentence ---
-    masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch(
-        [text],
+    """
+    Performs sequential mask-unmask on a single text, for a given number of iterations.
+    """
+    # --- prepare initial masked sentence---
+    masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch( #TODO: TAke the old prepare masked batch and add the conditions on masking positions
+        [text]*sequential_iterations,
         num_masks,
         rng,
         pipeline.tokenizer,
         pipeline.device,
     )
 
-    print("Substitutions after masking:", substitutions.shape) #1, 189,4 .. but why?
-    max_masks = substitutions.shape[1]
+    #print("Substitutions after masking:", substitutions.shape) #1, 189,4 .. but why? It is the first step!
+    max_masks = masked_token_tensor.shape[1] # number of tokens in the sentence, if masking fraction is 100%
 
     # ✅ PREALLOCATE [U, M, 4]
-    all_substitutions = torch.full(
-        (sequential_iterations, max_masks, 4),
-        -1,
-        dtype=torch.long,
-        device=pipeline.device,
-    )
+    #all_substitutions = substitutions #torch.full(
+        #(sequential_iterations, max_masks, 4),
+        #-1,
+        #dtype=torch.long,
+        #device=pipeline.device,
+    #)
+
+    #all_substitutions[0][:substitutions.shape[1]] = substitutions  # store initial masking step, leave rest as -1
 
     #print("all_substitutions shape:", all_substitutions.shape)
     for uturn in range(sequential_iterations):
         # For each uturn, we need to unmask the previously masked tokens, fill in the substitutions, and then re-mask for the next uturn.
 
-        step_tokens = masked_token_tensor
-        step_att = attention_tensor
-        step_subs = substitutions.clone()   # [1, M, 4]
+        step_tokens = masked_token_tensor[uturn, :].unsqueeze(0)
+        step_att = attention_tensor[uturn, :].unsqueeze(0)
+        step_subs = substitutions[uturn, :].unsqueeze(0) # [1, M, 4], filled with -1s at start, except for initial masking step, where it is filled with masked positions and original token ids.
 
         # --- unmask ---
         if pipeline.model_name.startswith("Dream-org/Dream"):
             print("Using Dream unmasking...")
-            step_subs = _unmask_dispatch(
-                step_tokens,
-                step_att,
-                step_subs,
+            unmasked_tokens, step_subs = _unmask_dispatch(
+                step_tokens, # Masked token tensor, re-written at the end of previous u-turn
+                step_att, # Attention tensor, re-written at the end of previous u-turn
+                step_subs, # Substitutions for this step, shape [1, M, 4], contain the mask token positions and token ids before masking
                 pipeline,
                 rng=None,
             )
@@ -429,25 +441,31 @@ def mask_unmask_monte_sequential(
                     substitution_step=step,
                     T=T,
                 )
+                
+            # Given the filled substitution tensor, update masked_token_tensor with the unmasked token ids
+            apply_substitutions(step_tokens, step_subs, state="final")
 
-        #print("Substitutions after unmasking:", step_subs.shape) # torch.Size([1, 189, 4])
-        #apply_substitutions(step_tokens, step_subs, state="final")
+        # ✅ Add the completed substitution tensor from the current step to the history. This concludes the unmasking and we move on to mask again
+        substitutions[uturn][:step_subs.shape[1]] = step_subs 
 
-        # ✅ STORE THIS U-TURN
-        all_substitutions[uturn] = step_subs[0] # Maybe here is the error?
+        masked_token_tensor[uturn, :] = unmasked_tokens.squeeze(0) # Where the token id is not the mask id
+        substitutions[uturn, :] = step_subs.squeeze(0)
 
-        # --- re-mask for next u-turn ---
-        if uturn + 1 < sequential_iterations:
-            mask = step_subs[0, :, 0] >= 0
-            positions = step_subs[0, mask, 0]
-            masked_token_tensor[0, positions] = pipeline.tokenizer.mask_token_id
+        # --- re-mask masked_token_tensor for next u-turn and prepare substitution tensor ---
+        if uturn < sequential_iterations-1:
+            masked_token_tensor[uturn+1] = unmasked_tokens #.squeeze(0)
+            subs_mask = substitutions[uturn+1,:,0] > 0 # Mask new masked token tensor at correct positions
+            masked_token_tensor[uturn+1,substitutions[uturn+1,subs_mask,0]] = pipeline.tokenizer.mask_token_id
+            substitutions[uturn+1,subs_mask,1] = masked_token_tensor[0,substitutions[uturn+1,subs_mask,0]] # Fill 'original' token ids in substitutions
+            # So substitutions[uturns+1] now only has information about which were the original token ids and at which positions are these
 
-            substitutions = step_subs.clone()
-            substitutions[0, mask, 1] = step_tokens[0, positions]
+        
 
     #print("shape of substitutions after mask_unmask_monte_sequential:", all_substitutions.shape) # torch.Size([10, 189, 4])
 
-    return all_substitutions
+    # Remove unnecessary lines: adjust all_substitutions[1] according to the actual maximum number of masks across each uturn step, deleting lines in which all values are -1
+
+    return substitutions
 
 
 def reconstruct_sequential_tensor_texts(initial_text, substitutions, pipeline):

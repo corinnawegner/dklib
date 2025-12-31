@@ -92,122 +92,9 @@ def diffusion_generate_infilling(
 
     return result
 
-
-def fill_unmask_steps_from_history(output, original_tokens, device):
-    """
-    Build a unified [batch_size, max_changes, 4] substitutions tensor.
-    Each row has: [token_position, token_before, token_after, diffusion_step]
-    """
-    histories = output.history  # list of [B, seq_len]
-    num_steps = len(histories)
-    batch_size = histories[0].shape[0]
-    seq_len = histories[0].shape[1]
-
-    history_stack = torch.stack(histories, dim=0).to(device)
-
-    # Collect per-sentence changes
-    all_changes = []
-    max_changes = 0
-
-    for b in range(batch_size):
-        changes = []
-        for t in range(1, num_steps):
-            prev_tokens = history_stack[t - 1, b]
-            curr_tokens = history_stack[t, b]
-
-            diff_mask = prev_tokens != curr_tokens
-            changed_positions = torch.nonzero(diff_mask, as_tuple=False).squeeze(-1)
-
-            for pos in changed_positions:
-                changes.append([
-                    pos.item(),                 # token position
-                    prev_tokens[pos].item(),    # token before
-                    curr_tokens[pos].item(),    # token after
-                    t - 1                       # diffusion step
-                ])
-
-        all_changes.append(changes)
-        max_changes = max(max_changes, len(changes))
-
-    # Create padded tensor: [batch_size, max_changes, 4]
-    substitutions = torch.full(
-        (batch_size, max_changes, 4), -1, dtype=torch.int64, device=device
-    )
-
-    for b, changes in enumerate(all_changes):
-        if len(changes) > 0:
-            substitutions[b, :len(changes)] = torch.tensor(changes, dtype=torch.int64, device=device)
-
-    return substitutions
-
 from typing import Iterable, Set
 import torch
 from transformers import PreTrainedTokenizerBase
-
-
-def fill_unmask_steps_from_history(output, original_tokens, device, mask_token_id=None):
-    """
-    Build a unified [batch_size, max_changes, 4] substitutions tensor from Dream diffusion history,
-    in the same format as BERT-style unmask_batch.
-
-    Args:
-        output: Diffusion generation output, must have `history` (list of [B, seq_len]).
-        original_tokens: The original masked token tensor [B, seq_len].
-        device: torch.device
-        mask_token_id: Optional mask token ID, used to initialize slot 2 for yet-to-be-unmasked tokens.
-
-    Returns:
-        substitutions: [B, max_changes, 4] tensor
-    """
-    histories = output.history  # list of [B, seq_len]
-    num_steps = len(histories)
-    batch_size, seq_len = histories[0].shape
-
-    history_stack = torch.stack(histories, dim=0).to(device)
-
-    all_changes = []
-    max_changes = 0
-
-    for b in range(batch_size):
-        changes = []
-        for t in range(1, num_steps):
-            prev_tokens = history_stack[t - 1, b]
-            curr_tokens = history_stack[t, b]
-
-            diff_mask = prev_tokens != curr_tokens
-            changed_positions = torch.nonzero(diff_mask, as_tuple=False).squeeze(-1)
-
-            for pos in changed_positions:
-                changes.append([
-                    pos.item(),                 # token position
-                    prev_tokens[pos].item(),    # token before
-                    curr_tokens[pos].item(),    # token after
-                    t - 1                       # diffusion step
-                ])
-        all_changes.append(changes)
-        max_changes = max(max_changes, len(changes))
-
-    # Initialize substitutions tensor
-    substitutions = torch.full(
-        (batch_size, max_changes, 4),
-        -1,
-        dtype=torch.int64,
-        device=device
-    )
-
-    for b, changes in enumerate(all_changes):
-        if len(changes) > 0:
-            # Fill the positions for tokens that actually changed
-            substitutions[b, :len(changes), :] = torch.tensor(changes, dtype=torch.int64, device=device)
-
-    # For slots that are still -1 (no diffusion yet), initialize slot 2 to mask_token_id
-    if mask_token_id is None:
-        mask_token_id = original_tokens.new_full((1,), -1).item()
-    mask_positions = substitutions[:, :, 2] == -1
-    substitutions[:, :, 2][mask_positions] = mask_token_id
-
-    return substitutions
-
 
 def compute_banned_token_ids(
     tokenizer: PreTrainedTokenizerBase,
@@ -269,54 +156,32 @@ def make_ban_tokens_logits_hook(banned_token_ids: torch.LongTensor):
     return logits_hook
 
 def build_dream_substitutions(
-    *,
-    original_tokens: torch.LongTensor,   # [B, L] BEFORE masking
-    masked_tokens: torch.LongTensor,     # [B, L] AFTER masking
-    final_tokens: torch.LongTensor,      # [B, L] diffusion output
-    history: list[torch.LongTensor],     # list of [B, L]
-    mask_token_id: int,
-    device: torch.device,
+    substitutions: torch.LongTensor,   # [num_masks, 4]
+    final_tokens: torch.LongTensor,      # [1, seq_len] diffusion output
+    history: list[torch.LongTensor],     # list of [1, seq_len], length = num mask
 ):
     """
-    Produce a BERT-compatible substitutions tensor from Dream diffusion.
-
+    Takes information from the substitutions tensor about the masking positions for each uturn step. Extracts the final token id from final_tokens to the corresponding 
+    masked token. Adds it to substitutions in the correct place. Also adds the unmasking step from the history (checks where in the history this token position was first not the mask token id)
+    And adds the final token id after unmasking.
     Returns:
-        substitutions: [B, M, 4]
+        substitutions: [num_uturns, num_masks, 4]
     """
-    B, L = masked_tokens.shape
-    num_steps = len(history)
+    # print('starting sentence: ', sent_ind)
+    #masked_token_sub_inds = torch.nonzero(
+    #    (substitutions[:, 2] == -1) & (substitutions[:, 0] >= 0) #extract masked token positions by checking where we have final id = -1 and position not -1
+    #)
 
-    # Identify originally masked positions
-    masked_pos = masked_tokens == mask_token_id          # [B, L]
-    M = masked_pos.sum(dim=1).max().item()                # max masks per batch
-
-    substitutions = torch.full(
-        (B, M, 4),
-        -1,
-        dtype=torch.long,
-        device=device
-    )
-
-    history_stack = torch.stack(history, dim=0)           # [T, B, L]
-
-    for b in range(B):
-        positions = torch.nonzero(masked_pos[b], as_tuple=False).squeeze(-1)
-
-        for j, pos in enumerate(positions):
-            # original token (pre-mask)
-            orig_token = original_tokens[b, pos]
-
-            # find FIRST diffusion step where this token changed
-            step = -1
-            for t in range(1, num_steps):
-                if history_stack[t, b, pos] != history_stack[t - 1, b, pos]:
-                    step = t - 1
-                    break
-
-            substitutions[b, j, 0] = pos
-            substitutions[b, j, 1] = orig_token
-            substitutions[b, j, 2] = final_tokens[b, pos]
-            substitutions[b, j, 3] = step
+    # Add unmasking step from history
+    for token_unmask in range(substitutions.shape[0]):
+        tok_pos = substitutions[token_unmask][0]
+        if tok_pos < 0:
+            continue
+        new_id = final_tokens[tok_pos]
+        history_token_pos = [tokens[tok_pos] for tokens in history]
+        step_at_unmasking = history_token_pos.index(new_id) # Where history_token_pos is not the mask token id for the first time
+        substitutions[token_unmask][2] = new_id
+        substitutions[token_unmask][3] = step_at_unmasking
 
     return substitutions
 
@@ -325,39 +190,42 @@ def unmask_batch_dream(
     attention_tensor: torch.Tensor,                 # [num_runs, seq_len]
     substitutions_old: torch.LongTensor,           # [num_runs, max_masks, 4]
     pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
-    mask_frac: float = 0.5,
+    #mask_frac: float = 0.5,
 ):
     """
-    Dream unmasking with BERT-compatible substitutions, sequential-safe.
+    Perform masked unmasking using Dream diffusion model within a FillMaskPipeline.
+    Args:
+        masked_token_tensor: [B: number of uturn steps, L: num tokens] tensor with masked tokens
+        attention_tensor: [B, L] attention mask
+        substitutions_old: [B, M: max number masks, 4] substitutions before unmasking, filled with masked positions and previous token ids at those positions
+        pipeline: FillMaskPipeline with Dream model
+        mask_frac: Fraction of tokens to mask (for diffusion steps)
+    Returns:
+        masked_token_tensor: Updated in-place with unmasked tokens
+        substitutions_new: [B, M, 4] new substitutions after unmasking
     """
     tok = pipeline.tokenizer
     model = pipeline.model
     device = masked_token_tensor.device
 
-    # 🚫 compute banned token IDs ONCE
+    # In the dream case I have a pre-filled substitutions tensor with previous token ids and positions stored in the substitutions tensor. However, I don't need to select the
+    # Unmasking positions myself, diffusion_generate_infilling does that. So I need to do the following here:
+    # - Obtain the masked token tensor after unmasking
+    # - Update the substitution tensor with the unmasking step! The final token will be done later anyway with the information from the masked_token_tensor
+
+    # compute banned token IDs ONCE
     if not hasattr(pipeline, "_banned_ids"):
         pipeline._banned_ids = compute_banned_token_ids(tok)
 
     banned_ids = pipeline._banned_ids
     logits_hook = make_ban_tokens_logits_hook(banned_ids)
 
-
-    # Bind custom diffusion method
+    # Bind custom diffusion method (TODO: Think where to put this to avoid repeated binding)
     model.diffusion_generate_infilling = types.MethodType(
         diffusion_generate_infilling, model
     )
 
-    batch_size, seq_len = masked_token_tensor.shape
-
-    # --- reconstruct ORIGINAL tokens (before masking) ---
-    original_tokens = masked_token_tensor.clone()
-    for b in range(batch_size):
-        mask = substitutions_old[b, :, 0] >= 0
-        pos = substitutions_old[b, mask, 0].long()
-        vals = substitutions_old[b, mask, 1]
-        for i, p in enumerate(pos):
-            if p < seq_len:
-                original_tokens[b, p] = vals[i]
+    batch_size, seq_len = masked_token_tensor.shape # in the sequential case it is 1, seq_len
 
     # Safety: never pass negatives to Dream
     masked_token_tensor = masked_token_tensor.clone()
@@ -370,27 +238,24 @@ def unmask_batch_dream(
         max_length=seq_len,
         output_history=True,
         return_dict_in_generate=True,
-        steps=512,#max(1, int(mask_frac * seq_len)),  # ensure at least 1 step
-        temperature=0.2,
+        steps=masked_token_tensor.shape[1],#max(1, int(mask_frac * seq_len)),  # ensure at least 1 step
+        temperature=1.0,
         top_p=0.95,
-        alg="entropy",
+        alg="origin",
         alg_temp=0.0,
         generation_logits_hook_func=logits_hook,
     )
 
     final_tokens = output.sequences[:, :seq_len].clone()
 
-    # --- build BERT-compatible substitutions ---
+    # --- update substitutions, not in place like for bert ---
     substitutions_new = build_dream_substitutions(
-        original_tokens=original_tokens,
-        masked_tokens=masked_token_tensor,
+        substitutions = substitutions_old, #original_tokens=original_tokens,
         final_tokens=final_tokens,
         history=output.history,
-        mask_token_id=tok.mask_token_id,
-        device=device,
     )
 
-    # Update token tensor in place
+    # Rewrite masked token tensor
     masked_token_tensor[:] = final_tokens
 
     return masked_token_tensor, substitutions_new
