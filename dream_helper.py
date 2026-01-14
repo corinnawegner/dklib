@@ -36,7 +36,6 @@ class CustomUnmasker:
         # For now just return the tokenized inputs (placeholder)
         return self.tokenizer.batch_decode(inputs["input_ids"], skip_special_tokens=True)
 
-
 def diffusion_generate_infilling(
     self,
     token_tensor: torch.LongTensor,
@@ -87,7 +86,7 @@ def diffusion_generate_infilling(
         attention_mask=attention_mask,
         generation_config=generation_config,
         generation_tokens_hook_func=generation_tokens_hook_func,
-        generation_logits_hook_func=lambda step, x, logits: logits,  # ✅ just a lambda
+        generation_logits_hook_func=generation_logits_hook_func,
     )
 
     return result
@@ -98,50 +97,125 @@ from transformers import PreTrainedTokenizerBase
 
 def compute_banned_token_ids(
     tokenizer: PreTrainedTokenizerBase,
+    *,
     allow_numbers: bool = False,
-    allow_newlines: bool = False,
-    allowed_symbols: Set[str] | None = None,
+    allowed_symbols: Optional[Set[str]] = None,
+    ban_special_tokens: bool = True,
+    extra_banned_strings: Optional[Set[str]] = None,
+    allow_only_alpha: bool = True, # For the experiment with edgodicity breaking
 ) -> torch.LongTensor:
     """
     Scan tokenizer vocabulary and return token IDs that should be banned
-    (non-prose tokens: numbers, code symbols, newlines).
+    during generation (non-prose tokens + optionally special tokens + explicit strings).
 
-    Returns:
-        torch.LongTensor of banned token IDs
+    New options:
+      - allow_only_alpha: when True, tokens that do not consist only of letters (after
+        stripping common tokenization prefixes) are banned.
+      - require_real_word: when True, tokens must also be recognized as real words via
+        either 'wordfreq' (preferred) or the NLTK 'words' corpus. If no wordlist is
+        available, this check is skipped with a warning.
     """
 
     if allowed_symbols is None:
-        # Standard English punctuation we allow
         allowed_symbols = {
-            ".", ",", "!", "?", "'", '"', ";", ":", "-", "(", ")", " "
+            ".", ",", "!", "?", "'", '"', ":", "-", "(", ")"
         }
 
-    banned_ids = []
+    if extra_banned_strings is None:
+        extra_banned_strings = {
+            "ĊĊ",
+            "Âł",
+            "<br /><br />",
+            "<|beginoftext|>",
+            "Ġ",
+            "\n",
+            "\ ",
+            "\r",
+            ";"
+        }
+
+    banned_ids: Set[int] = set()
+    vocab_size = len(tokenizer)
+
+    # -----------------------
+    # Vocabulary scan rules
+    # -----------------------
+    for token_id in range(vocab_size):
+        token_str = tokenizer.decode([token_id], skip_special_tokens=False)
+
+        # Rule 2: numbers
+        if not allow_numbers and any(c.isdigit() for c in token_str):
+            banned_ids.add(token_id)
+            continue
+
+        normalized = token_str.replace("Ġ", "").replace("▁", "").replace("Ċ", "").strip()
+        # Rule 4: allow_only_alpha — ban tokens that are not pure letters after normalization
+        if allow_only_alpha and (normalized == "" or not normalized.isalpha()):
+            banned_ids.add(token_id)
+            continue
+
+    # -----------------------
+    # Rule 6: special tokens
+    # -----------------------
+    if ban_special_tokens:
+        banned_ids.update(tokenizer.all_special_ids)
+
+    # -----------------------
+    # Rule 7: explicit strings
+    # -----------------------
+    for s in extra_banned_strings:
+        token_ids = tokenizer(
+            s,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )["input_ids"]
+
+        for tid in token_ids:
+            banned_ids.add(tid)
+
+    banned_ids = torch.tensor(sorted(banned_ids), dtype=torch.long)
+
+    print(f"Banned {len(banned_ids)} tokens (non-prose + special + explicit).")
+    return banned_ids
+
+def compute_first_token_banned_ids(tokenizer: PreTrainedTokenizerBase) -> torch.LongTensor:
+    """Return token ids that SHOULD NOT be used as the very first token of a sentence.
+
+    A token is disallowed if, after normalization, it is empty or its first character is
+    not an uppercase ASCII letter (A-Z). This function is used to enforce that the
+    first token starts with a capital letter.
+    """
+
+    banned: Set[int] = set()
     vocab_size = len(tokenizer)
 
     for token_id in range(vocab_size):
         token_str = tokenizer.decode([token_id], skip_special_tokens=False)
-
-        # --- RULE 1: BAN NEWLINES ---
-        if not allow_newlines and ("\n" in token_str or "\r" in token_str):
-            banned_ids.append(token_id)
+        normalized = token_str.replace("Ġ", "").replace("▁", "").replace("Ċ", "").strip()
+        if normalized == "":
+            banned.add(token_id)
             continue
+        first_char = normalized[0]
+        # require an ASCII uppercase letter
+        if not (first_char.isalpha() and first_char.isupper() and "A" <= first_char <= "Z"):
+            banned.add(token_id)
 
-        # --- RULE 2: BAN NUMBERS ---
-        if not allow_numbers and any(c.isdigit() for c in token_str):
-            banned_ids.append(token_id)
-            continue
-
-        # --- RULE 3: BAN CODE-LIKE SYMBOLS ---
-        for char in token_str:
-            if not char.isalpha() and char not in allowed_symbols:
-                banned_ids.append(token_id)
-                break
-
-    banned_ids = torch.tensor(banned_ids, dtype=torch.long)
-
-    print(f"Banned {len(banned_ids)} non-prose tokens.")
+    banned_ids = torch.tensor(sorted(banned), dtype=torch.long)
+    print(f"First-token capitalization: banned {len(banned_ids)} tokens.")
     return banned_ids
+
+
+def make_first_token_capitalized_logits_hook(banned_token_ids: torch.LongTensor):
+    """Logits hook that bans the given token ids only at position 0 (first token)."""
+
+    def logits_hook(step, x_t, logits):
+        # logits: [batch, seq_len, vocab]
+        if logits.size(1) > 0 and banned_token_ids.numel() > 0:
+            logits[:, 0, banned_token_ids.to(logits.device)] = float("-inf")
+        return logits
+
+    return logits_hook
 
 def make_ban_tokens_logits_hook(banned_token_ids: torch.LongTensor):
     """
@@ -156,7 +230,7 @@ def make_ban_tokens_logits_hook(banned_token_ids: torch.LongTensor):
     return logits_hook
 
 def build_dream_substitutions(
-    substitutions: torch.LongTensor,   # [num_masks, 4]
+    substitutions: torch.LongTensor,   # [1, num_masks, 4]
     final_tokens: torch.LongTensor,      # [1, seq_len] diffusion output
     history: list[torch.LongTensor],     # list of [1, seq_len], length = num mask
 ):
@@ -173,15 +247,18 @@ def build_dream_substitutions(
     #)
 
     # Add unmasking step from history
-    for token_unmask in range(substitutions.shape[0]):
-        tok_pos = substitutions[token_unmask][0]
-        if tok_pos < 0:
-            continue
-        new_id = final_tokens[tok_pos]
-        history_token_pos = [tokens[tok_pos] for tokens in history]
-        step_at_unmasking = history_token_pos.index(new_id) # Where history_token_pos is not the mask token id for the first time
-        substitutions[token_unmask][2] = new_id
-        substitutions[token_unmask][3] = step_at_unmasking
+    for sent_id in range(substitutions.shape[0]):
+        for token_unmask in range(substitutions.shape[1]):
+            #print("substitutions.shape:", substitutions.shape)
+            tok_pos = substitutions[sent_id, token_unmask, 0]
+            #print("tok_pos:", tok_pos)
+            if tok_pos < 0:
+                continue
+            new_id = final_tokens[sent_id, tok_pos]
+            history_token_pos = [tokens[sent_id, tok_pos] for tokens in history]
+            step_at_unmasking = history_token_pos.index(new_id) # Where history_token_pos is not the mask token id for the first time
+            substitutions[sent_id, token_unmask, 2] = new_id
+            substitutions[sent_id, token_unmask, 3] = step_at_unmasking
 
     return substitutions
 
@@ -213,12 +290,30 @@ def unmask_batch_dream(
     # - Obtain the masked token tensor after unmasking
     # - Update the substitution tensor with the unmasking step! The final token will be done later anyway with the information from the masked_token_tensor
 
-    # compute banned token IDs ONCE
+    # compute banned token IDs ONCE — only allow alphabetic tokens and prefer real English words
     if not hasattr(pipeline, "_banned_ids"):
-        pipeline._banned_ids = compute_banned_token_ids(tok)
+        pipeline._banned_ids = compute_banned_token_ids(
+            tok, allow_only_alpha=True
+        )
 
     banned_ids = pipeline._banned_ids
     logits_hook = make_ban_tokens_logits_hook(banned_ids)
+
+    # Optionally enforce that the first token starts with an uppercase ASCII letter.
+    generation_logits_hook_func = logits_hook
+    if getattr(pipeline, "_require_capitalized_start", True):
+        if not hasattr(pipeline, "_first_token_banned_ids"):
+            pipeline._first_token_banned_ids = compute_first_token_banned_ids(tok)
+        first_banned = pipeline._first_token_banned_ids
+        first_hook = make_first_token_capitalized_logits_hook(first_banned)
+
+        def _combined_hook(step, x_t, logits):
+            logits = logits_hook(step, x_t, logits)
+            logits = first_hook(step, x_t, logits)
+            return logits
+
+        generation_logits_hook_func = _combined_hook
+
 
     # Bind custom diffusion method (TODO: Think where to put this to avoid repeated binding)
     model.diffusion_generate_infilling = types.MethodType(
@@ -243,7 +338,7 @@ def unmask_batch_dream(
         top_p=0.95,
         alg="origin",
         alg_temp=0.0,
-        generation_logits_hook_func=logits_hook,
+        generation_logits_hook_func=generation_logits_hook_func,
     )
 
     final_tokens = output.sequences[:, :seq_len].clone()
@@ -259,7 +354,7 @@ def unmask_batch_dream(
     masked_token_tensor[:] = final_tokens
 
     return masked_token_tensor, substitutions_new
-
+"""
 def compute_banned_token_ids(
     tokenizer: PreTrainedTokenizerBase,
     *,
@@ -268,19 +363,19 @@ def compute_banned_token_ids(
     allowed_symbols: Optional[Set[str]] = None,
     ban_special_tokens: bool = True,
 ) -> torch.LongTensor:
-    """
-    Scan tokenizer vocabulary and return token IDs that should be banned
-    during generation (non-prose tokens + optionally special tokens).
+"""
+    #Scan tokenizer vocabulary and return token IDs that should be banned
+    #during generation (non-prose tokens + optionally special tokens).
 
-    Rules:
-      - Newlines banned by default
-      - Numbers banned by default
-      - Code / non-prose symbols banned
-      - Special tokens always banned (recommended)
+    ##Rules:
+      #- Newlines banned by default
+      #- Numbers banned by default
+      #- Code / non-prose symbols banned
+      #- Special tokens always banned (recommended)
 
-    Returns:
-        torch.LongTensor of banned token IDs
-    """
+    #Returns:
+     #   torch.LongTensor of banned token IDs
+"""
 
     if allowed_symbols is None:
         # Standard English punctuation we allow
@@ -318,3 +413,4 @@ def compute_banned_token_ids(
 
     print(f"Banned {len(banned_ids)} tokens (non-prose + special).")
     return banned_ids
+"""

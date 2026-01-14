@@ -4,9 +4,10 @@ from typing import Optional, Union, Literal
 
 from .dream_helper import (
     unmask_batch_dream,
-    fill_unmask_steps_from_history,
+    #fill_unmask_steps_from_history,
     diffusion_generate_infilling,
     CustomUnmasker,
+    compute_first_token_banned_ids,
 )
 
 def _unmask_dispatch(
@@ -36,7 +37,7 @@ def _unmask_dispatch(
             attention_tensor,
             substitutions,
             pipeline,
-            mask_frac=mask_frac,
+            #mask_frac=mask_frac,
         )
         return new_tokens, substitutions
 
@@ -147,11 +148,11 @@ def prepare_masked_batch(
         indices = torch.nonzero(allowed_tokens_mask, as_tuple=False).squeeze(-1)
 
         # forbid first and last valid token
-        if indices.numel() >= 3:
-            indices = indices[1:-1]
-        else:
+        #if indices.numel() >= 10:
+        indices = indices[:-1]
+        #else:
             # not enough tokens to safely mask anything
-            continue
+        #    continue
 
         num_masks = min(num_masks, indices.numel())
         if num_masks == 0:
@@ -239,6 +240,17 @@ def unmask_batch(
         # print('unmasking token: ',unmask_index, )
         token_index_in_sent = substitutions[sent_ind, unmask_index, 0]
         logits_pre_pmf = logits[sent_ind, token_index_in_sent, :].squeeze()
+
+        # Optionally enforce capitalization constraint at the sentence start
+        if int(token_index_in_sent) == 0 and getattr(pipeline, "_require_capitalized_start", True):
+            if not hasattr(pipeline, "_first_token_banned_ids"):
+                pipeline._first_token_banned_ids = compute_first_token_banned_ids(pipeline.tokenizer)
+            extra_illegal = pipeline._first_token_banned_ids.to(masked_token_tensor.device)
+            if illegal_tokens.numel() == 0:
+                illegal_tokens = extra_illegal
+            else:
+                illegal_tokens = torch.cat([illegal_tokens, extra_illegal]).unique()
+
         if(dont_predict_special_tokens):
             # print('logit shape: ',logits.shape, logits_pre_pmf.shape, illegal_tokens)
             logits_pre_pmf[illegal_tokens] = -1e10 # very small number, so that these tokens are never selected.
@@ -391,7 +403,7 @@ def mask_unmask_monte_sequential(
     Performs sequential mask-unmask on a single text, for a given number of iterations.
     """
     # --- prepare initial masked sentence---
-    masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch( #TODO: TAke the old prepare masked batch and add the conditions on masking positions
+    masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch(
         [text]*sequential_iterations,
         num_masks,
         rng,
@@ -454,12 +466,10 @@ def mask_unmask_monte_sequential(
         # --- re-mask masked_token_tensor for next u-turn and prepare substitution tensor ---
         if uturn < sequential_iterations-1:
             masked_token_tensor[uturn+1] = unmasked_tokens #.squeeze(0)
-            subs_mask = substitutions[uturn+1,:,0] > 0 # Mask new masked token tensor at correct positions
+            subs_mask = substitutions[uturn+1,:,0] > -1 # Mask new masked token tensor at correct positions
             masked_token_tensor[uturn+1,substitutions[uturn+1,subs_mask,0]] = pipeline.tokenizer.mask_token_id
             substitutions[uturn+1,subs_mask,1] = masked_token_tensor[0,substitutions[uturn+1,subs_mask,0]] # Fill 'original' token ids in substitutions
             # So substitutions[uturns+1] now only has information about which were the original token ids and at which positions are these
-
-        
 
     #print("shape of substitutions after mask_unmask_monte_sequential:", all_substitutions.shape) # torch.Size([10, 189, 4])
 

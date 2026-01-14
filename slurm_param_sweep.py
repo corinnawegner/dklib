@@ -134,8 +134,6 @@ def build_parameter_grid(args, steppable_parameters, flaggable_parameters, param
         print('this thread will run permuations: ',permutations_to_run)
     return permutations_to_run, inds_to_run, param_grid
 
-
-
 def run_sweep(base_parser, steppable_parameters, flaggable_parameters, parameter_types, experiment_function, return_outputs=False, WALL_TIME_BUFFER=60):
     """
     Run a parameter sweep over a grid of hyperparameters with SLURM support.
