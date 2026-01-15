@@ -1,26 +1,165 @@
 import types
 import torch
-from typing import Optional, Union, Set
+from typing import Optional, Union, Set, Callable
 import transformers
 from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
+from dream_model.generation_utils import (
+    DreamModel,
+    DreamGenerationConfig,
+    DreamModelOutput,
+    sample_tokens
+)
+
+
+# --------------------------------------------------
+# Custom Dream Model
+# --------------------------------------------------
+class CustomDreamModel(DreamModel):
+    """
+    Subclass of DreamModel allowing:
+      - Overriding _sample
+      - Optional custom diffusion_generate_infilling
+      - Token banning and grammar checking
+    """
+    def __init__(self, config, tokenizer=None, grammar_checker: Optional[Callable] = None):
+        super().__init__(config)
+        self.tokenizer = tokenizer  # optional tokenizer reference
+        self.grammar_checker = grammar_checker
+        self._banned_ids = None  # can be set later
+        self._first_token_banned_ids = None
+
+    # -------------------------------
+    # Example: override _sample
+    # -------------------------------
+    @torch.no_grad()
+    def _sample(self, input_ids, attention_mask, generation_config, generation_tokens_hook_func, generation_logits_hook_func):
+        """
+        Custom sampling logic here. Called by diffusion_generate internally.
+        """
+        print("CustomDreamModel._sample called!")
+        # Example: just call the original sample logic
+        x = input_ids.clone()
+
+        # Default Dream behavior (simplified):
+        # for each timestep, sample mask tokens
+        mask_token_id = generation_config.mask_token_id
+        steps = generation_config.steps
+        temperature = generation_config.temperature
+        top_p = generation_config.top_p
+        top_k = generation_config.top_k
+        eps = generation_config.eps
+        alg = generation_config.alg
+        alg_temp = generation_config.alg_temp
+
+        # pad to max_length
+        max_length = generation_config.max_length
+        x = torch.nn.functional.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+
+        for i in range(steps):
+            mask_index = (x == mask_token_id)
+            logits = self(x, attention_mask).logits
+            logits = logits[:, :-1]  # align logits for masking
+
+            logits = generation_logits_hook_func(i, x, logits)
+            mask_logits = logits[mask_index]
+
+            # sample tokens
+            _, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
+            x[mask_index] = x0
+
+            x = generation_tokens_hook_func(i, x, logits)
+
+        return DreamModelOutput(sequences=x, history=None)
+
+# ============================================================================
+# GRAMMAR CHECKING
+# ============================================================================
+
+def _init_grammar_checker(method: str = "gpt"):
+    """
+    Initialize grammar checker based on method.
+    Returns a callable that takes text and returns True if grammatically correct.
+    """
+    if method == "gpt":
+        try:
+            from openai import OpenAI
+            api_key = __import__('os').environ.get("OPENAI_API_KEY")
+            if not api_key:
+                print("Warning: OPENAI_API_KEY not set. Grammar checking disabled.")
+                return None
+            
+            client = OpenAI(api_key=api_key)
+            
+            def check_grammar_gpt(text: str, model: str = "gpt-4.1-nano") -> bool:
+                """Check if text is grammatically correct using GPT."""
+                try:
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a strict English grammar checker. "
+                                    "Return YES if the text is grammatically correct. "
+                                    "Return NO if the text has any grammar errors. "
+                                    "Respond with exactly ONE token: YES or NO. No explanation."
+                                )
+                            },
+                            {"role": "user", "content": text},
+                        ],
+                        max_tokens=1,
+                        temperature=0,
+                    )
+                    result = response.choices[0].message.content.strip().upper()
+                    return result == "YES"
+                except Exception as e:
+                    print(f"Warning: Grammar check failed: {e}")
+                    return True  # Default to allow if check fails
+            
+            return check_grammar_gpt
+        except ImportError:
+            print("Warning: OpenAI client not available. Grammar checking disabled.")
+            return None
+    else:
+        print(f"Warning: Grammar checking method '{method}' not implemented.")
+        return None
 
 
 class CustomUnmasker:
-    def __init__(self, model_name: str, device: int = 0, dtype=torch.bfloat16):
+    def __init__(self, model_name: str, device: int = 0, dtype=torch.bfloat16, local_model_path: Optional[str] = None):
         self._remote_code = True
         self.device = device
         
+        # Determine model path: use local path if provided, otherwise use model_name from HuggingFace
+        if local_model_path is not None:
+            # Load from local submodule
+            import os
+            if not os.path.exists(local_model_path):
+                raise FileNotFoundError(f"Local model path does not exist: {local_model_path}")
+            model_path = local_model_path
+            print(f"Loading Dream model from local path: {model_path}")
+        else:
+            # Load from HuggingFace Hub
+            model_path = model_name
+            print(f"Loading Dream model from HuggingFace Hub: {model_path}")
+        
         # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
         # Load model
         self.model = AutoModel.from_pretrained(
-            model_name,
+            model_path,
             torch_dtype=dtype,
             trust_remote_code=True
         ).to(device)
 
         self.model_name = model_name
+        
+        # Bind diffusion_generate_infilling function to the model
+        self.model.diffusion_generate_infilling = types.MethodType(
+            diffusion_generate_infilling, self.model
+        )
+
     
     def __call__(self, text: str, max_new_tokens: int = 50):
         """
@@ -36,6 +175,7 @@ class CustomUnmasker:
         # For now just return the tokenized inputs (placeholder)
         return self.tokenizer.batch_decode(inputs["input_ids"], skip_special_tokens=True)
 
+
 def diffusion_generate_infilling(
     self,
     token_tensor: torch.LongTensor,
@@ -45,6 +185,7 @@ def diffusion_generate_infilling(
 ):
     """
     Custom diffusion_generate that performs masked infilling.
+    This function is bound to the Dream model in CustomUnmasker.__init__.
     """
     generation_config = self._prepare_generation_config(generation_config, **kwargs)
     generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
@@ -91,6 +232,7 @@ def diffusion_generate_infilling(
 
     return result
 
+
 from typing import Iterable, Set
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -102,18 +244,19 @@ def compute_banned_token_ids(
     allowed_symbols: Optional[Set[str]] = None,
     ban_special_tokens: bool = True,
     extra_banned_strings: Optional[Set[str]] = None,
-    allow_only_alpha: bool = True, # For the experiment with edgodicity breaking
+    allow_only_alpha: bool = False,
+    require_real_word: bool = False,
 ) -> torch.LongTensor:
     """
     Scan tokenizer vocabulary and return token IDs that should be banned
     during generation (non-prose tokens + optionally special tokens + explicit strings).
 
-    New options:
+    Parameters:
       - allow_only_alpha: when True, tokens that do not consist only of letters (after
         stripping common tokenization prefixes) are banned.
-      - require_real_word: when True, tokens must also be recognized as real words via
-        either 'wordfreq' (preferred) or the NLTK 'words' corpus. If no wordlist is
-        available, this check is skipped with a warning.
+      - require_real_word: when True, tokens must be recognized as real words via
+        'wordfreq' or NLTK 'words' corpus. Single-letter tokens and non-dictionary words
+        are banned. Requires optional dependencies (wordfreq or nltk).
     """
 
     if allowed_symbols is None:
@@ -137,6 +280,22 @@ def compute_banned_token_ids(
     banned_ids: Set[int] = set()
     vocab_size = len(tokenizer)
 
+    # Initialize wordlist for real-word checking if needed
+    word_list = None
+    if require_real_word:
+        try:
+            from wordfreq import word_frequency
+            word_list = 'wordfreq'
+        except ImportError:
+            try:
+                import nltk
+                nltk.download('words', quiet=True)
+                from nltk.corpus import words as nltk_words
+                word_list = set(w.lower() for w in nltk_words.words())
+            except (ImportError, LookupError):
+                print("Warning: require_real_word=True but neither 'wordfreq' nor 'nltk' words corpus available. Skipping real-word check.")
+                require_real_word = False
+
     # -----------------------
     # Vocabulary scan rules
     # -----------------------
@@ -153,6 +312,24 @@ def compute_banned_token_ids(
         if allow_only_alpha and (normalized == "" or not normalized.isalpha()):
             banned_ids.add(token_id)
             continue
+
+        # Rule 5: require_real_word — ban single letters and non-dictionary words
+        if require_real_word and normalized != "":
+            # Ban single letters
+            if len(normalized) == 1:
+                banned_ids.add(token_id)
+                continue
+            # Check if it's a real word
+            if word_list == 'wordfreq':
+                from wordfreq import word_frequency
+                freq = word_frequency(normalized.lower(), 'en')
+                if freq == 0:
+                    banned_ids.add(token_id)
+                    continue
+            elif isinstance(word_list, set):
+                if normalized.lower() not in word_list:
+                    banned_ids.add(token_id)
+                    continue
 
     # -----------------------
     # Rule 6: special tokens
@@ -262,9 +439,85 @@ def build_dream_substitutions(
 
     return substitutions
 
+
+def _validate_and_resample_grammar(
+    final_tokens: torch.LongTensor,
+    tokenizer: PreTrainedTokenizerBase,
+    grammar_checker: Callable,
+    max_retries: int = 3,
+    device: torch.device = torch.device("cpu"),
+) -> torch.LongTensor:
+    """
+    Validate grammatical correctness of generated tokens and resample if needed.
+    
+    Args:
+        final_tokens: [B, L] tensor of token IDs
+        tokenizer: Tokenizer for decoding
+        grammar_checker: Callable that takes text and returns True if grammatically correct
+        max_retries: Max number of resampling attempts per sentence
+        device: Device to use
+    
+    Returns:
+        final_tokens: [B, L] tensor with grammatically-validated tokens
+    """
+    final_tokens = final_tokens.clone()
+    batch_size = final_tokens.shape[0]
+    
+    for batch_idx in range(batch_size):
+        # Decode the current sentence
+        text = tokenizer.decode(final_tokens[batch_idx], skip_special_tokens=True)
+        
+        # Check if grammatically correct
+        if not grammar_checker(text):
+            print(f"  Sentence {batch_idx} failed grammar check. Resampling...")
+            
+            # Try resampling by randomly replacing tokens until grammar passes
+            for retry in range(max_retries):
+                # Clone the tokens for this attempt
+                test_tokens = final_tokens[batch_idx].clone()
+                
+                # Randomly pick a non-special token position to resample
+                special_ids = set(tokenizer.all_special_ids)
+                valid_positions = [
+                    i for i in range(len(test_tokens))
+                    if test_tokens[i].item() not in special_ids
+                ]
+                
+                if not valid_positions:
+                    print(f"Retry {retry + 1}/{max_retries}: No valid positions to resample.")
+                    continue
+                
+                # Pick a random position
+                pos = valid_positions[torch.randint(0, len(valid_positions), (1,)).item()]
+                
+                # Resample a random token (excluding special tokens)
+                vocab_size = len(tokenizer)
+                while True:
+                    new_token_id = torch.randint(0, vocab_size, (1,)).item()
+                    if new_token_id not in special_ids:
+                        break
+                
+                test_tokens[pos] = new_token_id
+                test_text = tokenizer.decode(test_tokens, skip_special_tokens=True)
+                
+                if grammar_checker(test_text):
+                    print(f"    Retry {retry + 1}/{max_retries}: Grammar passed! ✓")
+                    final_tokens[batch_idx] = test_tokens
+                    break
+                else:
+                    print(f"    Retry {retry + 1}/{max_retries}: Still incorrect, trying again...")
+            else:
+                # All retries exhausted
+                print(f"  Could not fix grammar after {max_retries} retries. Using original tokens.")
+        else:
+            print(f"  Sentence {batch_idx} passed grammar check. ✓")
+    
+    return final_tokens
+
+
 def unmask_batch_dream(
-    masked_token_tensor: torch.LongTensor,          # [num_runs, seq_len]
-    attention_tensor: torch.Tensor,                 # [num_runs, seq_len]
+    masked_token_tensor: torch.LongTensor,         # [num_runs, seq_len]
+    attention_tensor: torch.Tensor,                # [num_runs, seq_len]
     substitutions_old: torch.LongTensor,           # [num_runs, max_masks, 4]
     pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
     #mask_frac: float = 0.5,
@@ -290,10 +543,16 @@ def unmask_batch_dream(
     # - Obtain the masked token tensor after unmasking
     # - Update the substitution tensor with the unmasking step! The final token will be done later anyway with the information from the masked_token_tensor
 
-    # compute banned token IDs ONCE — only allow alphabetic tokens and prefer real English words
+    # compute banned token IDs ONCE — read constraints from pipeline attributes
     if not hasattr(pipeline, "_banned_ids"):
+        allow_alpha = getattr(pipeline, "_allow_only_alpha", False)
+        allow_nums = getattr(pipeline, "_allow_numbers", False)
+        require_words = getattr(pipeline, "_require_real_word", False)
         pipeline._banned_ids = compute_banned_token_ids(
-            tok, allow_only_alpha=True
+            tok,
+            allow_only_alpha=allow_alpha,
+            allow_numbers=allow_nums,
+            require_real_word=require_words,
         )
 
     banned_ids = pipeline._banned_ids
@@ -315,11 +574,6 @@ def unmask_batch_dream(
         generation_logits_hook_func = _combined_hook
 
 
-    # Bind custom diffusion method (TODO: Think where to put this to avoid repeated binding)
-    model.diffusion_generate_infilling = types.MethodType(
-        diffusion_generate_infilling, model
-    )
-
     batch_size, seq_len = masked_token_tensor.shape # in the sequential case it is 1, seq_len
 
     # Safety: never pass negatives to Dream
@@ -327,6 +581,7 @@ def unmask_batch_dream(
     masked_token_tensor[masked_token_tensor < 0] = tok.mask_token_id
 
     # --- run Dream diffusion ---
+    # diffusion_generate_infilling is already bound to model in CustomUnmasker.__init__
     output = model.diffusion_generate_infilling(
         token_tensor=masked_token_tensor,
         attention_mask=attention_tensor,
@@ -349,6 +604,30 @@ def unmask_batch_dream(
         final_tokens=final_tokens,
         history=output.history,
     )
+
+    # --- optional grammar validation with resampling ---
+    if getattr(pipeline, "_validate_grammar", False):
+        if not hasattr(pipeline, "_grammar_checker"):
+            grammar_method = getattr(pipeline, "_grammar_method", "gpt")
+            pipeline._grammar_checker = _init_grammar_checker(grammar_method)
+        
+        grammar_checker = pipeline._grammar_checker
+        max_retries = getattr(pipeline, "_grammar_max_retries", 3)
+        
+        if grammar_checker is not None:
+            final_tokens = _validate_and_resample_grammar(
+                final_tokens,
+                tok,
+                grammar_checker,
+                max_retries=max_retries,
+                device=device,
+            )
+            # Rebuild substitutions with validated tokens
+            substitutions_new = build_dream_substitutions(
+                substitutions = substitutions_old,
+                final_tokens=final_tokens,
+                history=output.history,
+            )
 
     # Rewrite masked token tensor
     masked_token_tensor[:] = final_tokens
