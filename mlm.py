@@ -1,7 +1,61 @@
-import transformers
+iimport transformers
 import torch
-from typing import Optional, Union
+from typing import Optional, Union, Literal
 
+from .dream_helper import (
+    unmask_batch_dream,
+    #fill_unmask_steps_from_history,
+    diffusion_generate_infilling,
+    CustomUnmasker,
+)
+
+def _unmask_dispatch(
+    masked_token_tensor: torch.LongTensor,
+    attention_tensor: torch.Tensor,
+    substitutions: torch.LongTensor,
+    pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
+    rng: Optional[torch.Generator],
+    *,
+    substitution_step: Optional[int] = None,
+    T: float = 1.0,
+    dont_predict_special_tokens: bool = True,
+    max_kept: int = 100,
+    top_token_ids: Optional[torch.LongTensor] = None,
+    top_token_probs: Optional[torch.Tensor] = None,
+    mask_frac: Optional[float] = None,
+):
+    """
+    Unified unmasking entrypoint.
+    ALWAYS returns `substitutions`.
+    """
+
+    if pipeline.model_name.startswith("Dream-org/Dream"):
+        # Dream helper returns (tokens, substitutions)
+        new_tokens, substitutions = unmask_batch_dream(
+            masked_token_tensor,
+            attention_tensor,
+            substitutions,
+            pipeline,
+            #mask_frac=mask_frac,
+        )
+        return new_tokens, substitutions
+
+    else:
+        assert substitution_step is not None
+        unmask_batch(
+            masked_token_tensor,
+            attention_tensor,
+            substitutions,
+            pipeline,
+            rng,
+            substitution_step=substitution_step,
+            dont_predict_special_tokens=dont_predict_special_tokens,
+            T=T,
+            max_kept=max_kept,
+            top_token_ids=top_token_ids,
+            top_token_probs=top_token_probs,
+        )
+        return substitutions
 
 def prepare_masked_batch(
     texts: list[str],
@@ -90,7 +144,19 @@ def prepare_masked_batch(
         if num_masks == 0:
             continue
         allowed_tokens_mask = ~torch.isin(token_tensor[sentence_ind, :], disallowed_ids)
-        indices = torch.nonzero(allowed_tokens_mask).squeeze()
+        indices = torch.nonzero(allowed_tokens_mask, as_tuple=False).squeeze(-1)
+
+        # forbid first and last valid token
+        if indices.numel() >= 3:
+            indices = indices[1:-1]
+        else:
+            # not enough tokens to safely mask anything
+            continue
+
+        num_masks = min(num_masks, indices.numel())
+        if num_masks == 0:
+            continue
+
         # print(indices.shape[0], rng,device)
         subs_inds = torch.arange(num_masks, device=device)
         token_indices_to_mask, _ = torch.sort(
@@ -114,6 +180,7 @@ def prepare_masked_batch(
     substitutions[:, :, 2] = -1
     substitutions[:, :, 3] = -1
     return token_tensor, attention_tensor, substitutions
+
 
 def unmask_batch(
     masked_token_tensor: torch.LongTensor,
@@ -152,7 +219,7 @@ def unmask_batch(
     for sent_ind in range(batch_size):
         # print('starting sentence: ', sent_ind)
         masked_token_sub_inds = torch.nonzero(
-            (substitutions[sent_ind, :, 2] == -1) & (substitutions[sent_ind, :, 0] >= 0)
+            (substitutions[sent_ind, :, 2] == -1) & (substitutions[sent_ind, :, 0] >= 0) #extract masked token positions by checking where we have final id = -1 and position not -1
         )
         # print('mask of permitted substitutions: ', (substitutions[sent_ind, :, 2] == -1) & (substitutions[sent_ind,:,0] >= 0))
         # print('masked token sub inds: ',masked_token_sub_inds)
@@ -160,7 +227,7 @@ def unmask_batch(
             # then, there are no masked tokens remaining in the sentence, and we should continue with another sentence.
             # print(sent_ind, "skipping sentence!")
             continue
-        unmask_index = masked_token_sub_inds[
+        unmask_index = masked_token_sub_inds[ # pick a random position for unmasking
             torch.randint(
                 0,
                 masked_token_sub_inds.shape[0],
@@ -197,28 +264,29 @@ def unmask_batch(
             new_token_id = torch.multinomial(
                 new_token_pmf, 1, False, generator=rng
             )  # sampling a single token
-        masked_token_tensor[sent_ind, token_index_in_sent] = substitutions[
+        masked_token_tensor[sent_ind, token_index_in_sent] = substitutions[ # updating masked token tensor in place
             sent_ind, unmask_index, 2
         ] = new_token_id  # performing the substitution
-        substitutions[sent_ind, unmask_index, 3] = substitution_step
-
-
+        substitutions[sent_ind, unmask_index, 3] = substitution_step # updating substitution tensor with the unmasking step, not with the final token yet!!
 
 def apply_substitutions(
     token_tensor: torch.LongTensor, substitutions: torch.LongTensor, state="final", sequential=False
 ) -> None:
     """Applies the mask-unmask substitutions to a token tensor, for instance to see the final text.
+        Takes the information from the substitutions tensor and updates the token_tensor.
 
     Args:
         token_tensor (torch.LongTensor): The token tensor to be transformed, representing the initial input sentences.
-        substitutions (torch.LongTensor): The substitution record tensor
+        substitutions (torch.LongTensor): The substitution record tensor, shape [num_uturns or num_sents, num_masks, 4]
         state (str): One of 'final' or 'original' -- whether to restor the token tensor to the original state, or to apply the given substitutions.
+    Returns:
+        None: The token_tensor is modified in place.
     """
     assert (
         token_tensor.shape[0] == substitutions.shape[0]
     )  # ensure the batch sizes are the same.
     assert state in {"final", "original"}
-    substitution_index = 2 if state == "final" else 1
+    substitution_index = 2 if state == "final" else 1 # Is the token_tensor in the state before or after the mask-unmask step?
 
     if not sequential: 
         batch_indices = torch.arange(
@@ -232,180 +300,170 @@ def apply_substitutions(
         valid_token_indices = substitutions[:, :, 0][mask]
         valid_substitution_values = substitutions[:, :, substitution_index][mask]
         token_tensor[valid_batch_indices, valid_token_indices] = valid_substitution_values
-    else: 
+    else:  #Substitutions case
         # in the sequential case, we have to do this one sentence at a time, because each sentence may have a different number of substitutions.
         for sent_ind in range(token_tensor.shape[0]):
-            mask = substitutions[sent_ind,:,0] >= 0
-            token_indices = substitutions[sent_ind, :, 0][mask]
-            substitution_values = substitutions[sent_ind, :, substitution_index][mask]
-            token_tensor[sent_ind, token_indices] = substitution_values
+            mask = substitutions[sent_ind,:,0] >= 0 # determine which tokens have been masked
+            token_indices = substitutions[sent_ind, :, 0][mask] # take the token positions of the masked tokens
+            substitution_values = substitutions[sent_ind, :, substitution_index][mask] # If 'final', take the token ids after unmasking, if 'original', take the token ids before masking
+            token_tensor[sent_ind, token_indices] = substitution_values # Fill the token tensor at the positions where the tokens have been masked (final) or will be masked (original)
             token_tensor[sent_ind+1:, token_indices] = substitutions[sent_ind, :, 2][mask] #making sure we update all the later sentences to reflect the changes made so far.
 
     # batch_size = token_tensor.shape[0]
     # for sent_ind in range(batch_size):
     #     token_tensor[sent_ind,substitutions[sent_ind,:,0]] = substitutions[sent_ind,:,substitution_index]
 
-
 def mask_unmask_monte_batch(
     texts: list[str],
     pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
     num_masks: Union[int, float],
     rng: torch.Generator,
+    *,
+    T: float = 1.0,
     return_tokens: bool = False,
     return_top_tokens: bool = False,
-    T: float = 1.0,
     max_kept: int = 100,
-) -> Union[torch.LongTensor, tuple]:
-    """
-    Runs a mask-unmask monte carlo experiment on a set of texts using a fill mask pipeline.
-
-    Args:
-        texts (list[str]): The set of texts on which to act.
-        pipeline (transformers.pipelines.fill_mask.FillMaskPipeline): The fill mask pipeline.
-        num_masks (Union[int,  float]): Number of mask tokens to add to each text, or (if float) a probability between 0 and 1 for masking each token.
-        rng (torch.Generator): The random number generator used to perform masking and to choose unmasked characters.
-        return_tokens (bool): Return the token tensor as well.
-        return_top_tokens (bool): Return the top token candidates and their probabilities for each mask position.
-        T (float): Temperature for sampling from the unmasking distribution.
-        max_kept (int, optional): Maximum number of top token candidates to keep when return_top_tokens is True.
-
-
-    Returns:
-        torch.LongTensor: The substitutions tensor, of shape [batch_size = len(texts), num_masks, 4 ].
-        Last index is:
-          0: masked token position in sentence (-1 indicates no masking was needed due to batching),
-          1: original token id,
-          2: replacement token id,
-          3: unmasking step number at time of unmasking.
-
-        - If return_tokens=True: (substitutions, masked_token_tensor)
-        - If return_top_tokens=True: (substitutions, (top_token_ids, top_token_probs))  
-        - If both return_tokens and return_top_tokens=True: (substitutions, masked_token_tensor, (top_token_ids, top_token_probs))
-    """
+):
     masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch(
         texts, num_masks, rng, pipeline.tokenizer, pipeline.device
     )
-    maximum_number_of_masks = substitutions.shape[1]
-    batch_size = masked_token_tensor.shape[0]
 
-    # Optional top token storage
+    batch_size, max_masks = substitutions.shape[:2]
+
     top_token_ids = None
     top_token_probs = None
-    if return_top_tokens:
-        top_token_ids = torch.zeros((batch_size, maximum_number_of_masks, max_kept), dtype=torch.long)
-        top_token_probs = torch.zeros((batch_size, maximum_number_of_masks, max_kept), dtype=torch.float32)
+    if return_top_tokens and not pipeline.model_name.startswith("Dream-org/Dream"):
+        top_token_ids = torch.zeros(
+            (batch_size, max_masks, max_kept),
+            dtype=torch.long,
+            device=pipeline.device,
+        )
+        top_token_probs = torch.zeros(
+            (batch_size, max_masks, max_kept),
+            dtype=torch.float32,
+            device=pipeline.device,
+        )
 
-    for substitution_step in range(maximum_number_of_masks):
-        unmask_batch(
+    if not pipeline.model_name.startswith("Dream-org/Dream"):
+        for step in range(max_masks):
+            _unmask_dispatch(
+                masked_token_tensor,
+                attention_tensor,
+                substitutions,
+                pipeline,
+                rng,
+                substitution_step=step,
+                T=T,
+                max_kept=max_kept,
+                top_token_ids=top_token_ids,
+                top_token_probs=top_token_probs,
+                mask_frac=num_masks if num_masks < 1 else None,
+            )
+
+    elif pipeline.model_name.startswith("Dream-org/Dream"):
+        _unmask_dispatch(
             masked_token_tensor,
             attention_tensor,
             substitutions,
             pipeline,
-            rng,
-            substitution_step,
-            T=T,
-            max_kept=max_kept,
-            top_token_ids=top_token_ids,
-            top_token_probs=top_token_probs,
+            rng=None,
+
         )
 
-    return_list = [substitutions]
-    if(return_tokens):
-        return_list.append(masked_token_tensor)
-    if(return_top_tokens):
-        return_list.append((top_token_ids, top_token_probs))
-    return tuple(return_list)
+    outputs = [substitutions]
+    if return_tokens:
+        outputs.append(masked_token_tensor)
+    if return_top_tokens and not pipeline.model_name.startswith("Dream-org/Dream"):
+        outputs.append((top_token_ids, top_token_probs))
 
+    return tuple(outputs)
 
 def mask_unmask_monte_sequential(
-        text : str,
-        sequential_iterations : int, 
-        pipeline : transformers.pipelines.fill_mask.FillMaskPipeline,
-        num_masks : Union[int,float],
-        rng : torch.Generator,
-        return_tokens : bool = False,
-        return_top_tokens: bool = False,   # added
-        dont_predict_special_tokens : bool = True,
-        T : float = 1.0,
-        max_kept: int = 100,                # added
-) -> Union[torch.LongTensor, tuple]:
+    text: str,
+    sequential_iterations: int,
+    pipeline,
+    num_masks,
+    rng,
+    *,
+    T: float = 1.0,
+):
     """
-    Runs a mask-unmask monte carlo experiment on a single text using a fill mask pipeline, using sequential unmasking.
-    Args:
-        text (str): The text on which to act.
-        pipeline (transformers.pipelines.fill_mask.FillMaskPipeline): The fill mask pipeline.
-        num_masks (Union[int, float]): Number of mask tokens to add to each text, or (if float) a probability between 0 and 1 for masking each token.
-        rng (torch.Generator): The random number generator used to perform masking and to choose unmasked characters.
-        return_tokens (bool): Return the token tensor as well.
-        return_top_tokens (bool): Return the top token candidates and their probabilities for each mask position.
-        dont_predict_special_tokens (bool): If True, special tokens will not be predicted during unmasking.
-        T (float): Temperature for sampling from the unmasking distribution.
-        max_kept (int, optional): Maximum number of top token candidates to keep when return_top_tokens is True.
-
-    Returns:
-        torch.LongTensor: The substitutions tensor, of shape [unmasking_steps, num_masks, 4 ].
-        Last index is:
-          0: masked token position in sentence (-1 indicates no masking was needed due to batching),
-          1: original token id,
-          2: replacement token id,
-          3: unmasking step number at time of unmasking.
+    Performs sequential mask-unmask on a single text, for a given number of iterations.
     """
+    # --- prepare initial masked sentence---
     masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch(
-        [text]*sequential_iterations, num_masks, rng, pipeline.tokenizer, device=pipeline.device
+        [text]*sequential_iterations,
+        num_masks,
+        rng,
+        pipeline.tokenizer,
+        pipeline.device,
     )
-    maximum_number_of_masks = substitutions.shape[1]
 
-    # Optional top token storage
-    top_token_ids = None
-    top_token_probs = None
-    device = pipeline.device
-    if return_top_tokens:
-        top_token_ids = torch.zeros((sequential_iterations, maximum_number_of_masks, max_kept),
-                                    dtype=torch.long, device=device)
-        top_token_probs = torch.zeros((sequential_iterations, maximum_number_of_masks, max_kept),
-                                    dtype=torch.float32, device=device)
+    #print("Substitutions after masking:", substitutions.shape) #1, 189,4 .. but why? It is the first step!
+    max_masks = masked_token_tensor.shape[1] # number of tokens in the sentence, if masking fraction is 100%
 
-    for i in range(sequential_iterations):
-        # slice to maintain batch dimension
-        step_masked_token_tensor = masked_token_tensor[i, :].unsqueeze(0)
-        step_attention_tensor = attention_tensor[i, :].unsqueeze(0)
-        step_substitutions = substitutions[i, :].unsqueeze(0)
+    # ✅ PREALLOCATE [U, M, 4]
+    #all_substitutions = substitutions #torch.full(
+        #(sequential_iterations, max_masks, 4),
+        #-1,
+        #dtype=torch.long,
+        #device=pipeline.device,
+    #)
 
-        for substitution_step in range(maximum_number_of_masks):
-            unmask_batch(
-                step_masked_token_tensor,
-                step_attention_tensor,
-                step_substitutions,
+    #all_substitutions[0][:substitutions.shape[1]] = substitutions  # store initial masking step, leave rest as -1
+
+    #print("all_substitutions shape:", all_substitutions.shape)
+    for uturn in range(sequential_iterations):
+        # For each uturn, we need to unmask the previously masked tokens, fill in the substitutions, and then re-mask for the next uturn.
+
+        step_tokens = masked_token_tensor[uturn, :].unsqueeze(0)
+        step_att = attention_tensor[uturn, :].unsqueeze(0)
+        step_subs = substitutions[uturn, :].unsqueeze(0) # [1, M, 4], filled with -1s at start, except for initial masking step, where it is filled with masked positions and original token ids.
+
+        # --- unmask ---
+        if pipeline.model_name.startswith("Dream-org/Dream"):
+            print("Using Dream unmasking...")
+            unmasked_tokens, step_subs = _unmask_dispatch(
+                step_tokens, # Masked token tensor, re-written at the end of previous u-turn
+                step_att, # Attention tensor, re-written at the end of previous u-turn
+                step_subs, # Substitutions for this step, shape [1, M, 4], contain the mask token positions and token ids before masking
                 pipeline,
-                rng,
-                substitution_step,
-                dont_predict_special_tokens=dont_predict_special_tokens,
-                T=T,
-                max_kept=max_kept,
-                top_token_ids=top_token_ids[i:i+1] if return_top_tokens else None,
-                top_token_probs=top_token_probs[i:i+1] if return_top_tokens else None,
+                rng=None,
             )
+        else:
+            for step in range(max_masks):
+                _unmask_dispatch(
+                    step_tokens,
+                    step_att,
+                    step_subs,
+                    pipeline,
+                    rng,
+                    substitution_step=step,
+                    T=T,
+                )
+                
+            # Given the filled substitution tensor, update masked_token_tensor with the unmasked token ids
+            apply_substitutions(step_tokens, step_subs, state="final")
 
-        substitutions[i] = step_substitutions.squeeze(0)
-        masked_token_tensor[i] = step_masked_token_tensor.squeeze(0)
+        # ✅ Add the completed substitution tensor from the current step to the history. This concludes the unmasking and we move on to mask again
+        substitutions[uturn][:step_subs.shape[1]] = step_subs 
 
-        # Apply substitutions in place for next iteration
-        apply_substitutions(step_masked_token_tensor, step_substitutions, state='final')
+        masked_token_tensor[uturn, :] = unmasked_tokens.squeeze(0) # Where the token id is not the mask id
+        substitutions[uturn, :] = step_subs.squeeze(0)
 
-        # Prepare next step's masked_token_tensor if not last iteration
-        if i < sequential_iterations-1:
-            masked_token_tensor[i+1] = step_masked_token_tensor[0]
-            subs_mask = substitutions[i+1,:,0] > 0
-            masked_token_tensor[i+1,substitutions[i+1,subs_mask,0]] = pipeline.tokenizer.mask_token_id
-            substitutions[i+1,subs_mask,1] = step_masked_token_tensor[0,substitutions[i+1,subs_mask,0]]
+        # --- re-mask masked_token_tensor for next u-turn and prepare substitution tensor ---
+        if uturn < sequential_iterations-1:
+            masked_token_tensor[uturn+1] = unmasked_tokens #.squeeze(0)
+            subs_mask = substitutions[uturn+1,:,0] > 0 # Mask new masked token tensor at correct positions
+            masked_token_tensor[uturn+1,substitutions[uturn+1,subs_mask,0]] = pipeline.tokenizer.mask_token_id
+            substitutions[uturn+1,subs_mask,1] = masked_token_tensor[0,substitutions[uturn+1,subs_mask,0]] # Fill 'original' token ids in substitutions
+            # So substitutions[uturns+1] now only has information about which were the original token ids and at which positions are these
 
-    
-    return_list = [substitutions]
-    if(return_tokens):
-        return_list.append(masked_token_tensor)
-    if(return_top_tokens):
-        return_list.append((top_token_ids, top_token_probs))
-    return tuple(return_list)
+    #print("shape of substitutions after mask_unmask_monte_sequential:", all_substitutions.shape) # torch.Size([10, 189, 4])
+
+    # Remove unnecessary lines: adjust all_substitutions[1] according to the actual maximum number of masks across each uturn step, deleting lines in which all values are -1
+
+    return substitutions
 
 
 def reconstruct_sequential_tensor_texts(initial_text, substitutions, pipeline):
