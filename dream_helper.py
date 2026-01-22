@@ -85,6 +85,97 @@ def _init_grammar_checker(method: str = "gpt"):
         return None
 
 
+# ============================================================================
+# SENTIMENT STEERING
+# ============================================================================
+
+def _init_sentiment_model(sentiment_model_name: str = "SamLowe/roberta-base-go_emotions"):
+    """
+    Initialize sentiment/emotion model for steering.
+    Returns (tokenizer, model) or (None, None) if unavailable.
+    """
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        
+        tokenizer = AutoTokenizer.from_pretrained(sentiment_model_name)
+        model = AutoModelForSequenceClassification.from_pretrained(sentiment_model_name)
+        model.eval()
+        
+        print(f"Loaded sentiment model: {sentiment_model_name}")
+        return tokenizer, model
+    except Exception as e:
+        print(f"Warning: Failed to load sentiment model: {e}")
+        return None, None
+
+
+def _compute_sentiment_vector(
+    text: str,
+    sentiment_tokenizer,
+    sentiment_model,
+    device: torch.device = torch.device("cpu"),
+):
+    """
+    Compute emotion/sentiment vector for text.
+    Returns numpy array of emotion probabilities.
+    """
+    import torch.nn.functional as F
+    
+    inputs = sentiment_tokenizer(text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        logits = sentiment_model(**inputs).logits
+        probs = F.softmax(logits, dim=1).squeeze().cpu().numpy()
+    return probs
+
+
+def _sentiment_distance_to_neutral(sentiment_vector):
+    """
+    Compute distance of sentiment vector to neutral (all zeros).
+    Returns L2 norm of the vector.
+    """
+    import numpy as np
+    return np.linalg.norm(sentiment_vector)
+
+
+def _get_emotion_index(emotion_name: str, sentiment_model) -> int:
+    """
+    Get the index of an emotion in the model's label set.
+    
+    Args:
+        emotion_name: Name of the emotion (e.g., 'neutral', 'joy', 'sadness')
+        sentiment_model: The sentiment/emotion model
+    
+    Returns:
+        int: Index of the emotion in the model's config
+    """
+    if hasattr(sentiment_model, 'config') and hasattr(sentiment_model.config, 'id2label'):
+        id2label = sentiment_model.config.id2label
+        label2id = {v.lower(): k for k, v in id2label.items()}
+        emotion_lower = emotion_name.lower()
+        if emotion_lower in label2id:
+            return label2id[emotion_lower]
+        else:
+            available = list(label2id.keys())
+            raise ValueError(f"Emotion '{emotion_name}' not found. Available emotions: {available}")
+    else:
+        raise ValueError("Sentiment model does not have config.id2label attribute")
+
+
+def _sentiment_distance_to_target(sentiment_vector, target_emotion_index: int) -> float:
+    """
+    Compute distance of sentiment vector to a target emotion.
+    Only considers the probability of the target emotion.
+
+    Args:
+        sentiment_vector: Emotion probability distribution [num_emotions]
+        target_emotion_index: Index of the target emotion
+
+    Returns:
+        float: Distance as 1 - probability of the target emotion
+    """
+    # Distance is defined as 1 minus the probability of the target emotion
+    return sentiment_vector[target_emotion_index]
+
+
 class CustomUnmasker:
     def __init__(self, model_name: str, device: int = 0, dtype=torch.bfloat16, local_model_path: Optional[str] = None):
         self._remote_code = True
@@ -115,21 +206,11 @@ class CustomUnmasker:
         ).to(device)
 
         self.model_name = model_name
-
-    
-    def __call__(self, text: str, max_new_tokens: int = 50):
-        """
-        Placeholder for generating or unmasking text.
-        """
-        # Tokenize input
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
         
-        # Forward pass
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        
-        # For now just return the tokenized inputs (placeholder)
-        return self.tokenizer.batch_decode(inputs["input_ids"], skip_special_tokens=True)
+        # Initialize sentiment model (optional, for sentiment steering)
+        self.sentiment_tokenizer, self.sentiment_model = _init_sentiment_model()
+        if self.sentiment_model is not None:
+            self.sentiment_model = self.sentiment_model.to(device)
 
 
 def _diffusion_generate_infilling_impl(
@@ -202,17 +283,14 @@ def compute_banned_token_ids(
     extra_banned_strings: Optional[Set[str]] = None,
     allow_only_alpha: bool = False,
     require_real_word: bool = False,
+    strict_real_word: bool = False,  # New flag for stricter real-word enforcement
 ) -> torch.LongTensor:
     """
     Scan tokenizer vocabulary and return token IDs that should be banned
     during generation (non-prose tokens + optionally special tokens + explicit strings).
 
     Parameters:
-      - allow_only_alpha: when True, tokens that do not consist only of letters (after
-        stripping common tokenization prefixes) are banned.
-      - require_real_word: when True, tokens must be recognized as real words via
-        'wordfreq' or NLTK 'words' corpus. Single-letter tokens and non-dictionary words
-        are banned. Requires optional dependencies (wordfreq or nltk).
+      - strict_real_word: when True, bans tokens that are subwords or require multiple tokens to form a valid word.
     """
 
     if allowed_symbols is None:
@@ -222,15 +300,12 @@ def compute_banned_token_ids(
 
     if extra_banned_strings is None:
         extra_banned_strings = {
-            "ĊĊ",
-            "Âł",
-            "<br /><br />",
-            "<|beginoftext|>",
-            "Ġ",
             "\n",
-            "\ ",
             "\r",
-            ";"
+            "\ ",
+            "<|endoftext|>",
+            "ĊĊ",
+            "Âł"
         }
 
     banned_ids: Set[int] = set()
@@ -263,7 +338,8 @@ def compute_banned_token_ids(
             banned_ids.add(token_id)
             continue
 
-        normalized = token_str.replace("Ġ", "").replace("▁", "").replace("Ċ", "").strip()
+        normalized = token_str.replace("\u0120", "").replace("\u2581", "").replace("\u010a", "").strip()
+
         # Rule 4: allow_only_alpha — ban tokens that are not pure letters after normalization
         if allow_only_alpha and (normalized == "" or not normalized.isalpha()):
             banned_ids.add(token_id)
@@ -287,30 +363,19 @@ def compute_banned_token_ids(
                     banned_ids.add(token_id)
                     continue
 
+        # Rule 6: strict_real_word — ban subwords or compound tokens
+        if strict_real_word:
+            if token_str.startswith("##") or " " in token_str:
+                banned_ids.add(token_id)
+                continue
+
     # -----------------------
-    # Rule 6: special tokens
+    # Rule 7: special tokens
     # -----------------------
     if ban_special_tokens:
         banned_ids.update(tokenizer.all_special_ids)
 
-    # -----------------------
-    # Rule 7: explicit strings
-    # -----------------------
-    for s in extra_banned_strings:
-        token_ids = tokenizer(
-            s,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
-        )["input_ids"]
-
-        for tid in token_ids:
-            banned_ids.add(tid)
-
-    banned_ids = torch.tensor(sorted(banned_ids), dtype=torch.long)
-
-    print(f"Banned {len(banned_ids)} tokens (non-prose + special + explicit).")
-    return banned_ids
+    return torch.tensor(sorted(banned_ids), dtype=torch.long)
 
 def compute_first_token_banned_ids(tokenizer: PreTrainedTokenizerBase) -> torch.LongTensor:
     """Return token ids that SHOULD NOT be used as the very first token of a sentence.
@@ -396,79 +461,113 @@ def build_dream_substitutions(
     return substitutions
 
 
-def _validate_and_resample_grammar(
+def _validate_grammar(
     final_tokens: torch.LongTensor,
     tokenizer: PreTrainedTokenizerBase,
     grammar_checker: Callable,
-    max_retries: int = 3,
     device: torch.device = torch.device("cpu"),
-) -> torch.LongTensor:
+    banned_tokens_per_step: Optional[dict] = None,  # Dictionary to track banned tokens per step
+) -> bool:
     """
-    Validate grammatical correctness of generated tokens and resample if needed.
-    
+    Validate grammatical correctness of generated tokens.
+
     Args:
         final_tokens: [B, L] tensor of token IDs
         tokenizer: Tokenizer for decoding
         grammar_checker: Callable that takes text and returns True if grammatically correct
-        max_retries: Max number of resampling attempts per sentence
         device: Device to use
-    
+        banned_tokens_per_step: Dictionary to track banned tokens for the current step
+
     Returns:
-        final_tokens: [B, L] tensor with grammatically-validated tokens
+        bool: True if all sentences are grammatically correct, False otherwise
     """
-    final_tokens = final_tokens.clone()
     batch_size = final_tokens.shape[0]
-    
+    all_valid = True
+
     for batch_idx in range(batch_size):
-        # Decode the current sentence
         text = tokenizer.decode(final_tokens[batch_idx], skip_special_tokens=True)
-        
-        # Check if grammatically correct
+
         if not grammar_checker(text):
-            print(f"  Sentence {batch_idx} failed grammar check. Resampling...")
+            print(f"  Sentence {batch_idx} failed grammar check.")
             
-            # Try resampling by randomly replacing tokens until grammar passes
-            for retry in range(max_retries):
-                # Clone the tokens for this attempt
-                test_tokens = final_tokens[batch_idx].clone()
-                
-                # Randomly pick a non-special token position to resample
-                special_ids = set(tokenizer.all_special_ids)
-                valid_positions = [
-                    i for i in range(len(test_tokens))
-                    if test_tokens[i].item() not in special_ids
-                ]
-                
-                if not valid_positions:
-                    print(f"Retry {retry + 1}/{max_retries}: No valid positions to resample.")
-                    continue
-                
-                # Pick a random position
-                pos = valid_positions[torch.randint(0, len(valid_positions), (1,)).item()]
-                
-                # Resample a random token (excluding special tokens)
-                vocab_size = len(tokenizer)
-                while True:
-                    new_token_id = torch.randint(0, vocab_size, (1,)).item()
-                    if new_token_id not in special_ids:
-                        break
-                
-                test_tokens[pos] = new_token_id
-                test_text = tokenizer.decode(test_tokens, skip_special_tokens=True)
-                
-                if grammar_checker(test_text):
-                    print(f"    Retry {retry + 1}/{max_retries}: Grammar passed! ✓")
-                    final_tokens[batch_idx] = test_tokens
-                    break
-                else:
-                    print(f"    Retry {retry + 1}/{max_retries}: Still incorrect, trying again...")
-            else:
-                # All retries exhausted
-                print(f"  Could not fix grammar after {max_retries} retries. Using original tokens.")
+            # Identify the first unmasked token
+            mask_token_id = tokenizer.mask_token_id
+            first_unmasked_token_idx = (final_tokens[batch_idx] != mask_token_id).nonzero(as_tuple=True)[0][0]
+            first_unmasked_token_id = final_tokens[batch_idx, first_unmasked_token_idx].item()
+
+            # Exclude the token ID that caused the failure for the current step
+            if banned_tokens_per_step is not None:
+                if batch_idx not in banned_tokens_per_step:
+                    banned_tokens_per_step[batch_idx] = set()
+                banned_tokens_per_step[batch_idx].add(first_unmasked_token_id)
+
+            # Set the token ID to -1 to prevent its generation in this step
+            final_tokens[batch_idx, first_unmasked_token_idx] = -1
+            all_valid = False
         else:
             print(f"  Sentence {batch_idx} passed grammar check. ✓")
+
+    return all_valid
+
+
+def _validate_sentiment(
+    final_tokens: torch.LongTensor,
+    tokenizer: PreTrainedTokenizerBase,
+    sentiment_tokenizer,
+    sentiment_model,
+    device: torch.device = torch.device("cpu"),
+    sentiment_target: str = "neutral",
+    previous_best_score: Optional[float] = None,
+) -> tuple[bool, float]:
+    """
+    Validate that unmasked text is close to target sentiment/emotion.
     
-    return final_tokens
+    Args:
+        final_tokens: [B, L] tensor of token IDs
+        tokenizer: Dream tokenizer
+        sentiment_tokenizer: Sentiment model tokenizer
+        sentiment_model: Sentiment model
+        device: Device to use
+        sentiment_target: Target emotion (e.g., 'neutral', 'joy', 'sadness'). Default is 'neutral'.
+        previous_best_score: If provided, only accept if current score is BETTER (lower distance).
+                            If None, accept first attempt and return its score.
+    
+    Returns:
+        tuple[bool, float]: (validation_passed, score) where score is the distance to target emotion.
+                           validation_passed=True if this is first attempt OR score improved over previous_best_score.
+    """
+    batch_size = final_tokens.shape[0]
+    
+    # Get target emotion index
+    try:
+        target_idx = _get_emotion_index(sentiment_target, sentiment_model)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return False, float('inf')
+    
+    # Compute sentiment for all sentences in batch and take max distance (worst case)
+    max_distance = 0.0
+    for batch_idx in range(batch_size):
+        text = tokenizer.decode(final_tokens[batch_idx], skip_special_tokens=True)
+        sentiment_vector = _compute_sentiment_vector(
+            text, sentiment_tokenizer, sentiment_model, device=device
+        )
+        distance = _sentiment_distance_to_target(sentiment_vector, target_idx)
+        max_distance = max(max_distance, distance)
+    
+    # Determine validation result
+    if previous_best_score is None:
+        # First attempt: always accept and return score
+        print(f"  First sentiment check - storing baseline score: {max_distance:.4f}")
+        return True, max_distance
+    else:
+        # Subsequent attempts: only accept if improved (lower distance)
+        improved = max_distance < previous_best_score
+        if improved:
+            print(f"  Sentiment improved: {max_distance:.4f} < {previous_best_score:.4f}. ✓")
+        else:
+            print(f"  Sentiment did not improve: {max_distance:.4f} >= {previous_best_score:.4f}. Retrying...")
+        return improved, max_distance
 
 
 def unmask_batch_dream(
@@ -504,11 +603,13 @@ def unmask_batch_dream(
         allow_alpha = getattr(pipeline, "_allow_only_alpha", False)
         allow_nums = getattr(pipeline, "_allow_numbers", False)
         require_words = getattr(pipeline, "_require_real_word", False)
+        strict_words = getattr(pipeline, "_strict_real_word", False)  # Retrieve the strict_real_word flag
         pipeline._banned_ids = compute_banned_token_ids(
             tok,
             allow_only_alpha=allow_alpha,
             allow_numbers=allow_nums,
             require_real_word=require_words,
+            strict_real_word=strict_words,  # Pass the flag to the function
         )
 
     banned_ids = pipeline._banned_ids
@@ -556,34 +657,10 @@ def unmask_batch_dream(
 
     # --- update substitutions, not in place like for bert ---
     substitutions_new = build_dream_substitutions(
-        substitutions = substitutions_old, #original_tokens=original_tokens,
+        substitutions = substitutions_old,
         final_tokens=final_tokens,
         history=output.history,
     )
-
-    # --- optional grammar validation with resampling ---
-    if getattr(pipeline, "_validate_grammar", False):
-        if not hasattr(pipeline, "_grammar_checker"):
-            grammar_method = getattr(pipeline, "_grammar_method", "gpt")
-            pipeline._grammar_checker = _init_grammar_checker(grammar_method)
-        
-        grammar_checker = pipeline._grammar_checker
-        max_retries = getattr(pipeline, "_grammar_max_retries", 3)
-        
-        if grammar_checker is not None:
-            final_tokens = _validate_and_resample_grammar(
-                final_tokens,
-                tok,
-                grammar_checker,
-                max_retries=max_retries,
-                device=device,
-            )
-            # Rebuild substitutions with validated tokens
-            substitutions_new = build_dream_substitutions(
-                substitutions = substitutions_old,
-                final_tokens=final_tokens,
-                history=output.history,
-            )
 
     # Rewrite masked token tensor
     masked_token_tensor[:] = final_tokens

@@ -147,11 +147,11 @@ def prepare_masked_batch(
         indices = torch.nonzero(allowed_tokens_mask, as_tuple=False).squeeze(-1)
 
         # forbid first and last valid token
-        if indices.numel() >= 3:
-            indices = indices[1:-1]
-        else:
+        #if indices.numel() >= 3:
+        indices = indices[:-1]
+        #else:
             # not enough tokens to safely mask anything
-            continue
+         #   continue
 
         num_masks = min(num_masks, indices.numel())
         if num_masks == 0:
@@ -389,7 +389,12 @@ def mask_unmask_monte_sequential(
 ):
     """
     Performs sequential mask-unmask on a single text, for a given number of iterations.
+    
+    If grammar or sentiment validation is enabled and fails, re-runs unmasking with the same
+    masked input (up to max_retries).
     """
+    from dklib.dream_helper import _validate_grammar, _validate_sentiment, _init_grammar_checker
+    
     # --- prepare initial masked sentence---
     masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch(
         [text]*sequential_iterations,
@@ -399,54 +404,108 @@ def mask_unmask_monte_sequential(
         pipeline.device,
     )
 
-    #print("Substitutions after masking:", substitutions.shape) #1, 189,4 .. but why? It is the first step!
-    max_masks = masked_token_tensor.shape[1] # number of tokens in the sentence, if masking fraction is 100%
-
-    # ✅ PREALLOCATE [U, M, 4]
-    #all_substitutions = substitutions #torch.full(
-        #(sequential_iterations, max_masks, 4),
-        #-1,
-        #dtype=torch.long,
-        #device=pipeline.device,
-    #)
-
-    #all_substitutions[0][:substitutions.shape[1]] = substitutions  # store initial masking step, leave rest as -1
-
-    #print("all_substitutions shape:", all_substitutions.shape)
+    max_masks = masked_token_tensor.shape[1]
+    
     for uturn in range(sequential_iterations):
+        print(f"U-turn step: {uturn} of {sequential_iterations}")
         # For each uturn, we need to unmask the previously masked tokens, fill in the substitutions, and then re-mask for the next uturn.
 
         step_tokens = masked_token_tensor[uturn, :].unsqueeze(0)
         step_att = attention_tensor[uturn, :].unsqueeze(0)
-        step_subs = substitutions[uturn, :].unsqueeze(0) # [1, M, 4], filled with -1s at start, except for initial masking step, where it is filled with masked positions and original token ids.
+        step_subs = substitutions[uturn, :].unsqueeze(0) # [1, M, 4], filled with -1s at start, except for initial masking step
+        
+        # Store original masked tokens for potential retries
+        original_step_tokens = step_tokens.clone()
 
-        # --- unmask ---
-        if pipeline.model_name.startswith("Dream-org/Dream"):
-            print("Using Dream unmasking...")
-            unmasked_tokens, step_subs = _unmask_dispatch(
-                step_tokens, # Masked token tensor, re-written at the end of previous u-turn
-                step_att, # Attention tensor, re-written at the end of previous u-turn
-                step_subs, # Substitutions for this step, shape [1, M, 4], contain the mask token positions and token ids before masking
-                pipeline,
-                rng=None,
-            )
-        else:
-            for step in range(max_masks):
-                _unmask_dispatch(
+        # Get validation settings
+        validate_grammar = getattr(pipeline, "_validate_grammar", False)
+        sample_sentiment = getattr(pipeline, "_sample_sentiment", False)
+        max_unmasking_retries = getattr(pipeline, "_validation_max_retries", 5)
+        
+        # Initialize grammar checker if needed
+        if validate_grammar and not hasattr(pipeline, "_grammar_checker"):
+            grammar_method = getattr(pipeline, "_grammar_method", "gpt")
+            from dklib.dream_helper import _init_grammar_checker
+            pipeline._grammar_checker = _init_grammar_checker(grammar_method)
+
+        # --- unmask with potential retries ---
+        unmasking_attempt = 0
+        validation_passed = False
+
+        # --- Initialize illegal tokens for this u-turn ---
+        illegal_tokens_for_uturn = set()
+
+        while unmasking_attempt < max_unmasking_retries and not validation_passed:
+
+            if pipeline.model_name.startswith("Dream-org/Dream"):
+                print(f"Using Dream unmasking... (attempt {unmasking_attempt + 1}/{max_unmasking_retries})")
+                unmasked_tokens, step_subs = _unmask_dispatch(
                     step_tokens,
                     step_att,
                     step_subs,
                     pipeline,
-                    rng,
-                    substitution_step=step,
-                    T=T,
+                    rng=None,
                 )
-                
-            # Given the filled substitution tensor, update masked_token_tensor with the unmasked token ids
-            apply_substitutions(step_tokens, step_subs, state="final")
+            else:
+                for step in range(max_masks):
+                    _unmask_dispatch(
+                        step_tokens,
+                        step_att,
+                        step_subs,
+                        pipeline,
+                        rng,
+                        substitution_step=step,
+                        T=T,
+                    )
+                # Given the filled substitution tensor, update masked_token_tensor with the unmasked token ids
+                apply_substitutions(step_tokens, step_subs, state="final")
+                unmasked_tokens = step_tokens
 
-        # ✅ Add the completed substitution tensor from the current step to the history. This concludes the unmasking and we move on to mask again
-        substitutions[uturn][:step_subs.shape[1]] = step_subs 
+            # --- Validate unmasked tokens ---
+            validation_passed = True
+
+            # Check grammar if enabled
+            if validate_grammar:
+                grammar_checker = getattr(pipeline, "_grammar_checker", None)
+                if grammar_checker is not None:
+                    print(f"  Checking grammar...")
+                    print("Candidate: ", unmasked_tokens)
+                    if not _validate_grammar(unmasked_tokens, pipeline.tokenizer, grammar_checker, device=step_tokens.device):
+                        print(f"  Grammar validation failed, retrying unmasking...")
+                        validation_passed = False
+
+                        # Add the failed token to the illegal tokens for this u-turn
+                        failed_token_id = unmasked_tokens.squeeze(0)[0].item()  # Assuming first token is the failed one
+                        illegal_tokens_for_uturn.add(failed_token_id)
+
+                        # Reset step_tokens and step_subs for retry
+                        step_tokens = original_step_tokens.clone()
+                        step_subs = substitutions[uturn, :].unsqueeze(0).clone()
+
+                        # Exclude the failed token in the next attempt
+                        dont_predict_special_tokens = getattr(pipeline, "_dont_predict_special_tokens", True)
+
+                        # Exclude the failed token in the next attempt
+                        if dont_predict_special_tokens:
+                            illegal_tokens = torch.tensor(
+                                list(illegal_tokens_for_uturn), dtype=torch.int64, device=step_tokens.device
+                            ).unique()
+
+                        unmasking_attempt += 1
+                        continue
+
+            # If we reach here, validation passed
+            if validation_passed:
+                print(f"  All validations passed! ✓")
+
+        # Clear illegal tokens for the next u-turn
+        illegal_tokens_for_uturn.clear()
+        
+        if not validation_passed:
+            print(f"  Could not pass validation after {max_unmasking_retries} attempts. Using last attempt.")
+        
+        # ✅ Store the completed substitution tensor from the current step
+        substitutions[uturn][:step_subs.shape[1]] = step_subs
 
         masked_token_tensor[uturn, :] = unmasked_tokens.squeeze(0) # Where the token id is not the mask id
         substitutions[uturn, :] = step_subs.squeeze(0)
@@ -464,7 +523,6 @@ def mask_unmask_monte_sequential(
     # Remove unnecessary lines: adjust all_substitutions[1] according to the actual maximum number of masks across each uturn step, deleting lines in which all values are -1
 
     return substitutions
-
 
 def reconstruct_sequential_tensor_texts(initial_text, substitutions, pipeline):
     token_tensor = torch.tensor(pipeline.tokenizer.encode(initial_text, add_special_tokens=True)).unsqueeze(0).to(substitutions.device)
