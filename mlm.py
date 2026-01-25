@@ -148,7 +148,7 @@ def prepare_masked_batch(
 
         # forbid first and last valid token
         #if indices.numel() >= 3:
-        indices = indices[:-1]
+        indices = indices[1:-1]
         #else:
             # not enough tokens to safely mask anything
          #   continue
@@ -405,6 +405,17 @@ def mask_unmask_monte_sequential(
     )
 
     max_masks = masked_token_tensor.shape[1]
+
+    # Get validation settings
+    validate_grammar = getattr(pipeline, "_validate_grammar", False)
+    sample_sentiment = getattr(pipeline, "_sample_sentiment", False)
+    max_unmasking_retries = getattr(pipeline, "_validation_max_retries", 5)
+    
+    # Initialize grammar checker if needed
+    if validate_grammar and not hasattr(pipeline, "_grammar_checker"):
+        grammar_method = getattr(pipeline, "_grammar_method", "gpt")
+        from dklib.dream_helper import _init_grammar_checker
+        pipeline._grammar_checker = _init_grammar_checker(grammar_method)
     
     for uturn in range(sequential_iterations):
         print(f"U-turn step: {uturn} of {sequential_iterations}")
@@ -416,17 +427,6 @@ def mask_unmask_monte_sequential(
         
         # Store original masked tokens for potential retries
         original_step_tokens = step_tokens.clone()
-
-        # Get validation settings
-        validate_grammar = getattr(pipeline, "_validate_grammar", False)
-        sample_sentiment = getattr(pipeline, "_sample_sentiment", False)
-        max_unmasking_retries = getattr(pipeline, "_validation_max_retries", 5)
-        
-        # Initialize grammar checker if needed
-        if validate_grammar and not hasattr(pipeline, "_grammar_checker"):
-            grammar_method = getattr(pipeline, "_grammar_method", "gpt")
-            from dklib.dream_helper import _init_grammar_checker
-            pipeline._grammar_checker = _init_grammar_checker(grammar_method)
 
         # --- unmask with potential retries ---
         unmasking_attempt = 0
@@ -466,6 +466,8 @@ def mask_unmask_monte_sequential(
 
             # Check grammar if enabled
             if validate_grammar:
+                use_previous_uturn_step = False
+                use_last_attempt = True
                 grammar_checker = getattr(pipeline, "_grammar_checker", None)
                 if grammar_checker is not None:
                     print(f"  Checking grammar...")
@@ -494,21 +496,71 @@ def mask_unmask_monte_sequential(
                         unmasking_attempt += 1
                         continue
 
+            # Check sentiment if enabled
+            if sample_sentiment:
+                use_previous_uturn_step = True
+                use_last_attempt = False
+
+                sentiment_tokenizer = getattr(pipeline, "_sentiment_tokenizer", None)
+                sentiment_model = getattr(pipeline, "_sentiment_model", None)
+                sentiment_target = getattr(pipeline, "_sentiment_target", "POSITIVE")
+                previous_score = new_score if uturn > 0 else None
+
+                if sentiment_tokenizer is not None and sentiment_model is not None:
+                    print(f"  Checking sentiment...")
+                    validation_passed, sentiment_score = _validate_sentiment(
+                        unmasked_tokens,
+                        pipeline.tokenizer,
+                        sentiment_tokenizer,
+                        sentiment_model,
+                        device=step_tokens.device,
+                        sentiment_target=sentiment_target,
+                        previous_score = previous_score
+                    )
+
+                    new_score = sentiment_score
+
+                    if not validation_passed:
+                        print(f"  Sentiment validation failed (score: {sentiment_score}), retrying unmasking...")
+                        validation_passed = False
+
+                        # Reset step_tokens and step_subs for retry
+                        step_tokens = original_step_tokens.clone()
+                        step_subs = substitutions[uturn, :].unsqueeze(0).clone()
+
+                        # Update the substitution tensor to reflect no changes
+                        step_subs[:, :, 2] = step_subs[:, :, 1]  # Final token IDs match original token IDs
+                        substitutions[uturn, :step_subs.shape[1]] = step_subs.squeeze(0)
+
+                        unmasking_attempt += 1
+                        continue
+
             # If we reach here, validation passed
             if validation_passed:
+
                 print(f"  All validations passed! ✓")
 
         # Clear illegal tokens for the next u-turn
         illegal_tokens_for_uturn.clear()
         
         if not validation_passed:
-            print(f"  Could not pass validation after {max_unmasking_retries} attempts. Using last attempt.")
+            if use_last_attempt:
+                print(f"  Could not pass validation after {max_unmasking_retries} attempts. Using last attempt.")
         
-        # ✅ Store the completed substitution tensor from the current step
-        substitutions[uturn][:step_subs.shape[1]] = step_subs
+                # ✅ Store the completed substitution tensor from the current step
+                substitutions[uturn][:step_subs.shape[1]] = step_subs
 
-        masked_token_tensor[uturn, :] = unmasked_tokens.squeeze(0) # Where the token id is not the mask id
-        substitutions[uturn, :] = step_subs.squeeze(0)
+                masked_token_tensor[uturn, :] = unmasked_tokens.squeeze(0) # Where the token id is not the mask id
+                substitutions[uturn, :] = step_subs.squeeze(0)
+
+            if use_previous_uturn_step: # Fill with the unmasked text from the previous u-turn
+                print(f"  Could not pass validation after {max_unmasking_retries} attempts. Reverting to previous u-turn step.")
+                if uturn > 0:
+                    masked_token_tensor[uturn, :] = masked_token_tensor[uturn-1, :].clone()
+                    substitutions[uturn, :] = substitutions[uturn-1, :].clone()
+                else: # First u-turn, revert to original text
+                    masked_token_tensor[uturn, :] = original_step_tokens.squeeze(0)
+                    substitutions[uturn, :] = step_subs.squeeze(0)            
 
         # --- re-mask masked_token_tensor for next u-turn and prepare substitution tensor ---
         if uturn < sequential_iterations-1:
