@@ -1,3 +1,8 @@
+import math
+import random
+from typing import Optional
+import torch
+from transformers import PreTrainedTokenizerBase
 
 
 # ============================================================================
@@ -93,6 +98,7 @@ def _validate_sentiment(
     device: torch.device = torch.device("cpu"),
     sentiment_target: str = "POSITIVE",
     previous_score: Optional[float] = None,
+    alpha_acceptance: float = 100.0,
 ) -> tuple[bool, float]:
     """
     Validate that unmasked text is close to target sentiment/emotion.
@@ -113,14 +119,13 @@ def _validate_sentiment(
     """
      # Decode tokens to text
     text = tokenizer.decode(final_tokens.view(-1).tolist(), skip_special_tokens=True)
-
+    print(f"  Evaluating sentiment for text: \n {text}")
     # Get sentiment probabilities
     sentiment_vector = _compute_sentiment_vector(text, sentiment_tokenizer, sentiment_model, device=device)
 
     # ---- Map model output to (neg, neu, pos) ----
     if hasattr(sentiment_model.config, "id2label"):
         labels = [sentiment_model.config.id2label[i].upper() for i in range(len(sentiment_vector))]
-        #TODO: is the problem the caps? Are the labels stored in caps?
         score_neg = sentiment_vector[labels.index("NEGATIVE")]
         score_pos = sentiment_vector[labels.index("POSITIVE")]
         score_neu = sentiment_vector[labels.index("NEUTRAL")]
@@ -143,6 +148,7 @@ def _validate_sentiment(
 
     # Difference in "goodness"
     acceptance_probability = math.log(score) - math.log(previous_score)
+    acceptance_probability *= alpha_acceptance
 
     # Accept if improved
     if acceptance_probability >= 0:
@@ -151,7 +157,7 @@ def _validate_sentiment(
     else:
         # Probabilistic acceptance if worse
         log_random = math.log(random.uniform(0, 1))
-        if log_random < acceptance_probability:
+        if log_random+1000000 < acceptance_probability: # Disable Metropolis acceptance for debugging
             print(
                 f"Sentiment worsened but accepted probabilistically: "
                 f"log_random={log_random:.4f} < acceptance_probability={acceptance_probability:.4f}"

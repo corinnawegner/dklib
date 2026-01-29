@@ -1,6 +1,8 @@
 import types
 import torch
-from typing import Optional, Union, Set, Callable
+from typing import Optional, Union, Set, Callable, Iterable
+import math
+import random
 import transformers
 from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 from dream_model.modeling_dream import DreamModel
@@ -9,6 +11,17 @@ from dream_model.generation_utils import (
     DreamModelOutput,
     sample_tokens
 )
+import logging
+from .sentiment_steering import (
+    _init_sentiment_model,
+    _compute_sentiment_vector,
+    _compute_sentiment_score,
+    _validate_sentiment
+)
+
+# Configure logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
 # --------------------------------------------------
 # Custom Dream Model
@@ -85,99 +98,8 @@ def _init_grammar_checker(method: str = "gpt"):
         return None
 
 
-# ============================================================================
-# SENTIMENT STEERING
-# ============================================================================
-
-def _init_sentiment_model(sentiment_model_name: str = "SamLowe/roberta-base-go_emotions"):
-    """
-    Initialize sentiment/emotion model for steering.
-    Returns (tokenizer, model) or (None, None) if unavailable.
-    """
-    try:
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification
-        
-        tokenizer = AutoTokenizer.from_pretrained(sentiment_model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(sentiment_model_name)
-        model.eval()
-        
-        print(f"Loaded sentiment model: {sentiment_model_name}")
-        return tokenizer, model
-    except Exception as e:
-        print(f"Warning: Failed to load sentiment model: {e}")
-        return None, None
-
-
-def _compute_sentiment_vector(
-    text: str,
-    sentiment_tokenizer,
-    sentiment_model,
-    device: torch.device = torch.device("cpu"),
-):
-    """
-    Compute emotion/sentiment vector for text.
-    Returns numpy array of emotion probabilities.
-    """
-    import torch.nn.functional as F
-    
-    inputs = sentiment_tokenizer(text, return_tensors="pt").to(device)
-    with torch.no_grad():
-        logits = sentiment_model(**inputs).logits
-        probs = F.softmax(logits, dim=1).squeeze().cpu().numpy()
-    return probs
-
-
-def _sentiment_distance_to_neutral(sentiment_vector):
-    """
-    Compute distance of sentiment vector to neutral (all zeros).
-    Returns L2 norm of the vector.
-    """
-    import numpy as np
-    return np.linalg.norm(sentiment_vector)
-
-
-def _get_emotion_index(emotion_name: str, sentiment_model) -> int:
-    """
-    Get the index of an emotion in the model's label set.
-    
-    Args:
-        emotion_name: Name of the emotion (e.g., 'neutral', 'joy', 'sadness')
-        sentiment_model: The sentiment/emotion model
-    
-    Returns:
-        int: Index of the emotion in the model's config
-    """
-    if hasattr(sentiment_model, 'config') and hasattr(sentiment_model.config, 'id2label'):
-        id2label = sentiment_model.config.id2label
-        label2id = {v.lower(): k for k, v in id2label.items()}
-        emotion_lower = emotion_name.lower()
-        if emotion_lower in label2id:
-            return label2id[emotion_lower]
-        else:
-            available = list(label2id.keys())
-            raise ValueError(f"Emotion '{emotion_name}' not found. Available emotions: {available}")
-    else:
-        raise ValueError("Sentiment model does not have config.id2label attribute")
-
-
-def _sentiment_distance_to_target(sentiment_vector, target_emotion_index: int) -> float:
-    """
-    Compute distance of sentiment vector to a target emotion.
-    Only considers the probability of the target emotion.
-
-    Args:
-        sentiment_vector: Emotion probability distribution [num_emotions]
-        target_emotion_index: Index of the target emotion
-
-    Returns:
-        float: Distance as 1 - probability of the target emotion
-    """
-    # Distance is defined as 1 minus the probability of the target emotion
-    return sentiment_vector[target_emotion_index]
-
-
 class CustomUnmasker:
-    def __init__(self, model_name: str, device: int = 0, dtype=torch.bfloat16, local_model_path: Optional[str] = None):
+    def __init__(self, model_name: str, device: int = 0, sentiment_model: Optional[str] = None, dtype=torch.bfloat16, local_model_path: Optional[str] = None):
         self._remote_code = True
         self.device = device
         
@@ -206,13 +128,13 @@ class CustomUnmasker:
         ).to(device)
 
         self.model_name = model_name
+        self.sentiment_model = sentiment_model
         
         # Initialize sentiment model (optional, for sentiment steering)
-        self.sentiment_tokenizer, self.sentiment_model = _init_sentiment_model()
         if self.sentiment_model is not None:
+            self.sentiment_tokenizer, self.sentiment_model = _init_sentiment_model(self.sentiment_model)
             self.sentiment_model = self.sentiment_model.to(device)
-
-
+            
 def _diffusion_generate_infilling_impl(
     self,
     token_tensor: torch.LongTensor,
@@ -225,8 +147,13 @@ def _diffusion_generate_infilling_impl(
     This function is bound to CustomDreamModel instances in CustomDreamModel.__init__.
     """
     generation_config = self._prepare_generation_config(generation_config, **kwargs)
-    generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
-    generation_logits_hook_func = kwargs.pop("generation_logits_hook_func", lambda step, x, logits: logits)
+
+    # Apply banned token hook
+    banned_token_ids = compute_banned_token_ids(self.tokenizer)
+    #logger.debug(f"Banned token IDs computed: {banned_token_ids}")
+
+    # Create logits hook
+    generation_logits_hook_func = make_ban_tokens_logits_hook(banned_token_ids)
 
     input_ids = token_tensor
     attention_mask = attention_tensor
@@ -240,39 +167,30 @@ def _diffusion_generate_infilling_impl(
         has_default_max_length=has_default_max_length,
         input_ids_length=input_ids_length,
     )
-    # we allow the max length to be exactly the input length, ignoring a valueerror and warning that this can lead to unexpected behaviour.
-    #self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
 
     max_length = generation_config.max_length
     mask_token_id = generation_config.mask_token_id
     pad_token_id = generation_config.pad_token_id
 
-    # pad if needed
+    # Pad if needed
     if input_ids_length < max_length:
         pad_len = max_length - input_ids_length
-        # compared to the original code, we pad with the pad token, not the mask token
         pad_token = torch.full((input_ids.size(0), pad_len), pad_token_id, dtype=torch.long, device=device)
         input_ids = torch.cat([input_ids, pad_token], dim=-1)
         if attention_mask is not None:
             pad_mask = torch.ones((attention_mask.size(0), pad_len), dtype=attention_mask.dtype, device=device)
             attention_mask = torch.cat([attention_mask, pad_mask], dim=-1)
 
-
-    # skip expand — we want single completion
+    # Skip expand — we want single completion
     result = self._sample(
         input_ids,
         attention_mask=attention_mask,
         generation_config=generation_config,
-        generation_tokens_hook_func=generation_tokens_hook_func,
         generation_logits_hook_func=generation_logits_hook_func,
+        generation_tokens_hook_func = lambda step, x_t, logits: x_t # Pass the missing argument
     )
 
     return result
-
-
-from typing import Iterable, Set
-import torch
-from transformers import PreTrainedTokenizerBase
 
 def compute_banned_token_ids(
     tokenizer: PreTrainedTokenizerBase,
@@ -300,32 +218,42 @@ def compute_banned_token_ids(
 
     if extra_banned_strings is None:
         extra_banned_strings = {
+            #' ',
             "\n",
             "\r",
-            "\ ",
+            #":", "(", ")", "-", "/", "?", "!", # Very strict
             "<|endoftext|>",
-            "ĊĊ",
-            "Âł"
+            "ĊĊ", "•",
+            "Âł",
+            "<br>",
+            "<br/>",
+            "Ċ", "^"
+            "Ã", "#", "*"
+            "Ĺ", "â","Ģ","¢","Ė","Ī","Ļ","Ĳ","Ď","Ė","Ē",
+              "Ŀ","Ń","Ņ","Ŋ","Ŕ","Ŗ","Ş","Ť","Ŧ","Ũ","Ū","Ŭ","Ů","Ű","Ų", "Ŵ","Ŷ","Ÿ","Ź","Ż","Ž", "Ġ", "[","]",
+              "<", ">", "{","}","%","^","*","_","+","=","\\","|","~","`", ".\n", "?\n",",\n","!\n", ":\n", ",\n" ,";\n", ")\n"
         }
 
     banned_ids: Set[int] = set()
     vocab_size = len(tokenizer)
 
+    # Centralized import handling for optional dependencies
+    word_frequency = None
+    nltk = None
+    nltk_words = None
+
     # Initialize wordlist for real-word checking if needed
     word_list = None
     if require_real_word:
-        try:
-            from wordfreq import word_frequency
-            word_list = 'wordfreq'
-        except ImportError:
-            try:
-                import nltk
-                nltk.download('words', quiet=True)
-                from nltk.corpus import words as nltk_words
-                word_list = set(w.lower() for w in nltk_words.words())
-            except (ImportError, LookupError):
-                print("Warning: require_real_word=True but neither 'wordfreq' nor 'nltk' words corpus available. Skipping real-word check.")
-                require_real_word = False
+        if word_frequency is None and nltk_words is None:
+            print("Warning: Real-word checking is disabled due to missing dependencies.")
+            require_real_word = False
+        elif word_frequency:
+            # Use wordfreq for real-word checking
+            pass
+        elif nltk_words:
+            # Use nltk for real-word checking
+            pass
 
     # -----------------------
     # Vocabulary scan rules
@@ -335,6 +263,16 @@ def compute_banned_token_ids(
 
         # Rule 2: numbers
         if not allow_numbers and any(c.isdigit() for c in token_str):
+            banned_ids.add(token_id)
+            continue
+
+        # Rule 2b: ban tokens containing newlines or carriage returns
+        if "\n" in token_str or "\r" in token_str:
+            banned_ids.add(token_id)
+            continue
+
+        # Rule 3: explicit banned strings
+        if any(banned in token_str for banned in extra_banned_strings):
             banned_ids.add(token_id)
             continue
 
@@ -353,11 +291,13 @@ def compute_banned_token_ids(
                 continue
             # Check if it's a real word
             if word_list == 'wordfreq':
-                from wordfreq import word_frequency
-                freq = word_frequency(normalized.lower(), 'en')
-                if freq == 0:
-                    banned_ids.add(token_id)
-                    continue
+                if word_frequency:
+                    freq = word_frequency(normalized.lower(), 'en')
+                    if freq == 0:
+                        banned_ids.add(token_id)
+                        continue
+                else:
+                    print("Warning: wordfreq is not available.")
             elif isinstance(word_list, set):
                 if normalized.lower() not in word_list:
                     banned_ids.add(token_id)
@@ -377,40 +317,42 @@ def compute_banned_token_ids(
 
     return torch.tensor(sorted(banned_ids), dtype=torch.long)
 
-def compute_first_token_banned_ids(tokenizer: PreTrainedTokenizerBase) -> torch.LongTensor:
-    """Return token ids that SHOULD NOT be used as the very first token of a sentence.
-
-    A token is disallowed if, after normalization, it is empty or its first character is
-    not an uppercase ASCII letter (A-Z). This function is used to enforce that the
-    first token starts with a capital letter.
+def compute_first_token_allowed_ids(tokenizer: PreTrainedTokenizerBase) -> torch.LongTensor:
     """
-
-    banned: Set[int] = set()
+    Return token IDs that are allowed as the very first token of a sentence.
+    A token is allowed if it starts with an uppercase ASCII letter (A-Z).
+    """
+    allowed: Set[int] = set()
     vocab_size = len(tokenizer)
 
     for token_id in range(vocab_size):
         token_str = tokenizer.decode([token_id], skip_special_tokens=False)
         normalized = token_str.replace("Ġ", "").replace("▁", "").replace("Ċ", "").strip()
-        if normalized == "":
-            banned.add(token_id)
-            continue
-        first_char = normalized[0]
-        # require an ASCII uppercase letter
-        if not (first_char.isalpha() and first_char.isupper() and "A" <= first_char <= "Z"):
-            banned.add(token_id)
+        if normalized and "A" <= normalized[0] <= "Z":
+            allowed.add(token_id)
 
-    banned_ids = torch.tensor(sorted(banned), dtype=torch.long)
-    print(f"First-token capitalization: banned {len(banned_ids)} tokens.")
-    return banned_ids
+    allowed_ids = torch.tensor(sorted(list(allowed)), dtype=torch.long)
+    print(f"First-token capitalization: allowed {len(allowed_ids)} tokens.")
+    return allowed_ids
 
 
-def make_first_token_capitalized_logits_hook(banned_token_ids: torch.LongTensor):
-    """Logits hook that bans the given token ids only at position 0 (first token)."""
+def make_first_token_capitalized_logits_hook(
+    tokenizer: PreTrainedTokenizerBase,
+    first_token_allowed_ids: torch.LongTensor
+):
+    """
+    Returns a logits hook that enforces the first token must start with a capital letter.
+    It does this by creating a mask that bans all tokens except those in first_token_allowed_ids.
+    """
+    vocab_size = len(tokenizer)
+    allowed_mask = torch.zeros(vocab_size, dtype=torch.bool)
+    allowed_mask[first_token_allowed_ids] = True
 
     def logits_hook(step, x_t, logits):
         # logits: [batch, seq_len, vocab]
-        if logits.size(1) > 0 and banned_token_ids.numel() > 0:
-            logits[:, 0, banned_token_ids.to(logits.device)] = float("-inf")
+        if logits.size(1) > 0:
+            # Ban all tokens that are not in the allowed list for the first position
+            logits[:, 0, ~allowed_mask.to(logits.device)] = float("-inf")
         return logits
 
     return logits_hook
@@ -509,73 +451,12 @@ def _validate_grammar(
 
     return all_valid
 
-
-def _validate_sentiment(
-    final_tokens: torch.LongTensor,
-    tokenizer: PreTrainedTokenizerBase,
-    sentiment_tokenizer,
-    sentiment_model,
-    device: torch.device = torch.device("cpu"),
-    sentiment_target: str = "neutral",
-    previous_best_score: Optional[float] = None,
-) -> tuple[bool, float]:
-    """
-    Validate that unmasked text is close to target sentiment/emotion.
-    
-    Args:
-        final_tokens: [B, L] tensor of token IDs
-        tokenizer: Dream tokenizer
-        sentiment_tokenizer: Sentiment model tokenizer
-        sentiment_model: Sentiment model
-        device: Device to use
-        sentiment_target: Target emotion (e.g., 'neutral', 'joy', 'sadness'). Default is 'neutral'.
-        previous_best_score: If provided, only accept if current score is BETTER (lower distance).
-                            If None, accept first attempt and return its score.
-    
-    Returns:
-        tuple[bool, float]: (validation_passed, score) where score is the distance to target emotion.
-                           validation_passed=True if this is first attempt OR score improved over previous_best_score.
-    """
-    batch_size = final_tokens.shape[0]
-    
-    # Get target emotion index
-    try:
-        target_idx = _get_emotion_index(sentiment_target, sentiment_model)
-    except ValueError as e:
-        print(f"Error: {e}")
-        return False, float('inf')
-    
-    # Compute sentiment for all sentences in batch and take max distance (worst case)
-    max_distance = 0.0
-    for batch_idx in range(batch_size):
-        text = tokenizer.decode(final_tokens[batch_idx], skip_special_tokens=True)
-        sentiment_vector = _compute_sentiment_vector(
-            text, sentiment_tokenizer, sentiment_model, device=device
-        )
-        distance = _sentiment_distance_to_target(sentiment_vector, target_idx)
-        max_distance = max(max_distance, distance)
-    
-    # Determine validation result
-    if previous_best_score is None:
-        # First attempt: always accept and return score
-        print(f"  First sentiment check - storing baseline score: {max_distance:.4f}")
-        return True, max_distance
-    else:
-        # Subsequent attempts: only accept if improved (lower distance)
-        improved = max_distance < previous_best_score
-        if improved:
-            print(f"  Sentiment improved: {max_distance:.4f} < {previous_best_score:.4f}. ✓")
-        else:
-            print(f"  Sentiment did not improve: {max_distance:.4f} >= {previous_best_score:.4f}. Retrying...")
-        return improved, max_distance
-
-
 def unmask_batch_dream(
     masked_token_tensor: torch.LongTensor,         # [num_runs, seq_len]
     attention_tensor: torch.Tensor,                # [num_runs, seq_len]
     substitutions_old: torch.LongTensor,           # [num_runs, max_masks, 4]
     pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
-    #mask_frac: float = 0.5,
+    illegal_tokens: Optional[torch.LongTensor] = None,  # Additional tokens to ban for this call
 ):
     """
     Perform masked unmasking using Dream diffusion model within a FillMaskPipeline.
@@ -613,22 +494,29 @@ def unmask_batch_dream(
         )
 
     banned_ids = pipeline._banned_ids
+    
+    # Merge with additional illegal tokens if provided
+    if illegal_tokens is not None and illegal_tokens.numel() > 0:
+        # Concatenate and get unique IDs
+        banned_ids = torch.cat([banned_ids.to(illegal_tokens.device), illegal_tokens]).unique()
+        print(f"  Banning {illegal_tokens.numel()} additional token(s) for this attempt.")
+    
     logits_hook = make_ban_tokens_logits_hook(banned_ids)
 
     # Optionally enforce that the first token starts with an uppercase ASCII letter.
     generation_logits_hook_func = logits_hook
-    if getattr(pipeline, "_require_capitalized_start", True):
-        if not hasattr(pipeline, "_first_token_banned_ids"):
-            pipeline._first_token_banned_ids = compute_first_token_banned_ids(tok)
-        first_banned = pipeline._first_token_banned_ids
-        first_hook = make_first_token_capitalized_logits_hook(first_banned)
+    #if getattr(pipeline, "_require_capitalized_start", True): ALWAYS ENFORCE
+    if not hasattr(pipeline, "_first_token_allowed_ids"):
+        pipeline._first_token_allowed_ids = compute_first_token_allowed_ids(tok)
+    first_allowed = pipeline._first_token_allowed_ids
+    first_hook = make_first_token_capitalized_logits_hook(tok, first_allowed)
 
-        def _combined_hook(step, x_t, logits):
-            logits = logits_hook(step, x_t, logits)
-            logits = first_hook(step, x_t, logits)
-            return logits
+    def _combined_hook(step, x_t, logits):
+        logits = logits_hook(step, x_t, logits)
+        logits = first_hook(step, x_t, logits)
+        return logits
 
-        generation_logits_hook_func = _combined_hook
+    generation_logits_hook_func = _combined_hook
 
 
     batch_size, seq_len = masked_token_tensor.shape # in the sequential case it is 1, seq_len
@@ -666,63 +554,3 @@ def unmask_batch_dream(
     masked_token_tensor[:] = final_tokens
 
     return masked_token_tensor, substitutions_new
-"""
-def compute_banned_token_ids(
-    tokenizer: PreTrainedTokenizerBase,
-    *,
-    allow_numbers: bool = False,
-    allow_newlines: bool = False,
-    allowed_symbols: Optional[Set[str]] = None,
-    ban_special_tokens: bool = True,
-) -> torch.LongTensor:
-"""
-    #Scan tokenizer vocabulary and return token IDs that should be banned
-    #during generation (non-prose tokens + optionally special tokens).
-
-    ##Rules:
-      #- Newlines banned by default
-      #- Numbers banned by default
-      #- Code / non-prose symbols banned
-      #- Special tokens always banned (recommended)
-
-    #Returns:
-     #   torch.LongTensor of banned token IDs
-"""
-
-    if allowed_symbols is None:
-        # Standard English punctuation we allow
-        allowed_symbols = {
-            ".", ",", "!", "?", "'", '"', ";", ":", "-", "(", ")", " "
-        }
-
-    banned_ids: Set[int] = set()
-    vocab_size = len(tokenizer)
-
-    for token_id in range(vocab_size):
-        token_str = tokenizer.decode([token_id], skip_special_tokens=False)
-
-        # --- RULE 1: BAN NEWLINES ---
-        if not allow_newlines and ("\n" in token_str or "\r" in token_str):
-            banned_ids.add(token_id)
-            continue
-
-        # --- RULE 2: BAN NUMBERS ---
-        if not allow_numbers and any(c.isdigit() for c in token_str):
-            banned_ids.add(token_id)
-            continue
-
-        # --- RULE 3: BAN CODE / NON-PROSE SYMBOLS ---
-        for char in token_str:
-            if not char.isalpha() and char not in allowed_symbols:
-                banned_ids.add(token_id)
-                break
-
-    # --- RULE 4: BAN SPECIAL TOKENS (CRITICAL) ---
-    if ban_special_tokens:
-        banned_ids.update(tokenizer.all_special_ids)
-
-    banned_ids = torch.tensor(sorted(banned_ids), dtype=torch.long)
-
-    print(f"Banned {len(banned_ids)} tokens (non-prose + special).")
-    return banned_ids
-"""
