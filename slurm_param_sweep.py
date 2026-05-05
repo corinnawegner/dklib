@@ -74,6 +74,7 @@ def add_slurm_parameters(base_parser:argparse.ArgumentParser):
     base_parser.add_argument('--end_permutation_index',type=int,default=None,help='Index of the last permutation to run. If None, defaults to the last permutation.')
     base_parser.add_argument('--skip_existing_permutations',action='store_true',help='If set, will skip permutations for which output files already exist.')
     base_parser.add_argument('--existing_permutations_output_prefix',type=str,default=None,help='If set, will look for existing output files with this prefix to determine which permutations to skip, instead of using the output_filename_prefix.')
+    base_parser.add_argument('--permutation_index_offset',type=int,default=0,help='Offset added to permutation indices for output filenames. Use when appending a second batch to an existing results directory with non-overlapping index ranges.')
     #debugging the parameters to sweep through.
     base_parser.add_argument('--debug_params',action='store_true',help='If set, will print out the parameter grid and exit.')
     #file output: 
@@ -125,7 +126,7 @@ def build_parameter_grid(args, steppable_parameters, flaggable_parameters, param
     if(args.end_permutation_index is None):
         args.end_permutation_index = N_permutations
     start_indices = np.linspace(args.start_permutation_index,args.end_permutation_index,args.N_jobs+1).astype(int)
-    inds_to_run = np.arange(start_indices[args.job_index-args.min_job_index],start_indices[args.job_index+1-args.min_job_index])
+    inds_to_run = np.arange(start_indices[args.job_index-args.min_job_index],start_indices[args.job_index+1-args.min_job_index]) + getattr(args, 'permutation_index_offset', 0)
     print('this thread will run indices: ',inds_to_run)
     permutations_to_run = permutations[start_indices[args.job_index-args.min_job_index]:start_indices[args.job_index+1-args.min_job_index]]
     if(args.debug_params):

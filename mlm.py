@@ -1,6 +1,7 @@
 import transformers
 import torch
 from typing import Optional, Union, Literal
+from collections import defaultdict
 
 from .dream_helper import (
     unmask_batch_dream,
@@ -8,6 +9,28 @@ from .dream_helper import (
     #diffusion_generate_infilling,
     CustomUnmasker,
 )
+
+
+def _get_string_to_ids_map(pipeline):
+    """
+    Build (and cache on the pipeline) a dict mapping each decoded token string
+    to the set of all token IDs that decode to that string.
+    This handles BPE aliasing: multiple token IDs can produce the same text.
+    """
+    if hasattr(pipeline, "_string_to_ids_map"):
+        return pipeline._string_to_ids_map
+
+    tok = pipeline.tokenizer
+    vocab_size = len(tok)
+    s2ids = defaultdict(set)
+    print("[build_string_to_ids_map] Scanning vocabulary …")
+    for tid in range(vocab_size):
+        decoded = tok.decode([tid], skip_special_tokens=False)
+        s2ids[decoded].add(tid)
+    pipeline._string_to_ids_map = dict(s2ids)
+    n_aliases = sum(1 for v in s2ids.values() if len(v) > 1)
+    print(f"[build_string_to_ids_map] Done – {vocab_size} IDs, {len(s2ids)} unique strings, {n_aliases} with aliases.")
+    return pipeline._string_to_ids_map
 
 def _unmask_dispatch(
     masked_token_tensor: torch.LongTensor,
@@ -24,6 +47,7 @@ def _unmask_dispatch(
     top_token_probs: Optional[torch.Tensor] = None,
     mask_frac: Optional[float] = None,
     illegal_tokens: Optional[torch.LongTensor] = None,
+    position_banned_tokens: Optional[dict] = None,
 ):
     """
     Unified unmasking entrypoint.
@@ -38,6 +62,7 @@ def _unmask_dispatch(
             substitutions,
             pipeline,
             illegal_tokens=illegal_tokens,
+            position_banned_tokens=position_banned_tokens,
         )
         return new_tokens, substitutions
 
@@ -449,9 +474,9 @@ def mask_unmask_monte_sequential(
     initial_valid_mask = initial_mask_positions >= 0
     initial_tokens[initial_mask_positions[initial_valid_mask]] = substitutions[0, initial_valid_mask, 1]
     last_validated_tokens = initial_tokens.unsqueeze(0)
+    last_uturn_token_ids = last_validated_tokens.clone()  # [1, seq_len] – the token IDs from the previous u-turn
 
     for uturn in range(sequential_iterations):
-        print(f"U-turn step: {uturn} of {sequential_iterations}")
 
         # For each uturn, we need to unmask the previously masked tokens, fill in the substitutions, and then re-mask for the next uturn.
         step_tokens = masked_token_tensor[uturn, :].unsqueeze(0)
@@ -461,25 +486,18 @@ def mask_unmask_monte_sequential(
         mask_positions = step_subs[0, :, 0]
         valid_mask = mask_positions >= 0
 
-        # --- Initialize illegal tokens for this u-turn ---
-        #illegal_tokens_for_uturn = set()
+        position_banned_tokens = None
 
         # Unmask
         if pipeline.model_name.startswith("Dream-org/Dream"):
             #print(f"Using Dream unmasking... (attempt {unmasking_attempt + 1}/{max_unmasking_retries})")
-            # Convert illegal tokens set to tensor for this attempt
-            illegal_tokens_tensor = None
-            #if illegal_tokens_for_uturn:
-            #    illegal_tokens_tensor = torch.tensor(
-            #        list(illegal_tokens_for_uturn), dtype=torch.int64, device=step_tokens.device
-            #    )
             unmasked_tokens, step_subs = _unmask_dispatch(
                 step_tokens,
                 step_att,
                 step_subs,
                 pipeline,
                 rng=None,
-                illegal_tokens=illegal_tokens_tensor,
+                position_banned_tokens=position_banned_tokens,
             )
         else:
             for step in range(max_masks):
@@ -569,8 +587,9 @@ def mask_unmask_monte_sequential(
             # Validation passed, update last_validated_tokens to current state
             last_validated_tokens = unmasked_tokens.clone()
 
-        print("FINAL SENTENCE AFTER THE UTURN WHICH WILL BE STORED IN SUBSTITUTIONS: ")
-        print(pipeline.tokenizer.decode(unmasked_tokens[0,:], skip_special_tokens=True))
+        # Store current token ids for banning in the next u-turn
+        last_uturn_token_ids = unmasked_tokens.clone()
+
         # --- re-mask masked_token_tensor for next u-turn and prepare substitution tensor ---
         if uturn < sequential_iterations-1:
             masked_token_tensor[uturn+1] = unmasked_tokens #.squeeze(0)

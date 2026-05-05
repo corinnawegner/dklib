@@ -128,11 +128,23 @@ class CustomUnmasker:
         ).to(device)
 
         self.model_name = model_name
-        self.sentiment_model = sentiment_model
+        self.sentiment_model_name = sentiment_model
+        self.sentiment_model = None
+        self.sentiment_tokenizer = None
         
         # Initialize sentiment model (optional, for sentiment steering)
-        if self.sentiment_model is not None:
-            self.sentiment_tokenizer, self.sentiment_model = _init_sentiment_model(self.sentiment_model)
+        if self.sentiment_model_name is not None:
+            self.sentiment_tokenizer, self.sentiment_model = _init_sentiment_model(
+                self.sentiment_model_name, sample_sentiment=True
+            )
+            if self.sentiment_model is None:
+                raise RuntimeError(
+                    f"Sentiment model '{self.sentiment_model_name}' failed to load. "
+                    f"Pre-cache it on a login node with: "
+                    f"python -c \"from transformers import AutoTokenizer, AutoModelForSequenceClassification; "
+                    f"AutoTokenizer.from_pretrained('{self.sentiment_model_name}'); "
+                    f"AutoModelForSequenceClassification.from_pretrained('{self.sentiment_model_name}')\""
+                )
             self.sentiment_model = self.sentiment_model.to(device)
             
 def _diffusion_generate_infilling_impl(
@@ -148,12 +160,14 @@ def _diffusion_generate_infilling_impl(
     """
     generation_config = self._prepare_generation_config(generation_config, **kwargs)
 
-    # Apply banned token hook
-    banned_token_ids = compute_banned_token_ids(self.tokenizer)
-    #logger.debug(f"Banned token IDs computed: {banned_token_ids}")
-
-    # Create logits hook
-    generation_logits_hook_func = make_ban_tokens_logits_hook(banned_token_ids)
+    # Use caller-provided logits hook if supplied (it already includes
+    # general token bans, per-position bans, and capitalisation);
+    # otherwise fall back to the default banned-token hook.
+    if "generation_logits_hook_func" in kwargs and kwargs["generation_logits_hook_func"] is not None:
+        generation_logits_hook_func = kwargs["generation_logits_hook_func"]
+    else:
+        banned_token_ids = compute_banned_token_ids(self.tokenizer)
+        generation_logits_hook_func = make_ban_tokens_logits_hook(banned_token_ids)
 
     input_ids = token_tensor
     attention_mask = attention_tensor
@@ -227,8 +241,8 @@ def compute_banned_token_ids(
             "Âł",
             "<br>",
             "<br/>",
-            "Ċ", "^"
-            "Ã", "#", "*"
+            "Ċ", "^",
+            "Ã", "#", "*",
             "Ĺ", "â","Ģ","¢","Ė","Ī","Ļ","Ĳ","Ď","Ė","Ē",
               "Ŀ","Ń","Ņ","Ŋ","Ŕ","Ŗ","Ş","Ť","Ŧ","Ũ","Ū","Ŭ","Ů","Ű","Ų", "Ŵ","Ŷ","Ÿ","Ź","Ż","Ž", "Ġ", "[","]",
               "<", ">", "{","}","%","^","*","_","+","=","\\","|","~","`", ".\n", "?\n",",\n","!\n", ":\n", ",\n" ,";\n", ")\n"
@@ -271,7 +285,8 @@ def compute_banned_token_ids(
             banned_ids.add(token_id)
             continue
 
-        # Rule 3: explicit banned strings
+        # Rule 3: explicit banned strings — check decoded text only
+        # (checking raw vocab strings would ban all Ġ-prefixed tokens since "Ġ" is in extra_banned_strings)
         if any(banned in token_str for banned in extra_banned_strings):
             banned_ids.add(token_id)
             continue
@@ -314,6 +329,17 @@ def compute_banned_token_ids(
     # -----------------------
     if ban_special_tokens:
         banned_ids.update(tokenizer.all_special_ids)
+        # Also ban every token in the added vocabulary (chat-template / tool / fim
+        # / vision / mask tokens such as <|im_start|>, <|im_end|>, <|endoftext|>,
+        # <|fim_prefix|>, etc.). These are "special" tokens that must not appear
+        # in continuous prose; in particular several of them are routinely
+        # followed by a newline in the model's training data and would
+        # effectively act like pressing Enter mid-paragraph if generated.
+        try:
+            added_vocab = tokenizer.get_added_vocab()
+            banned_ids.update(int(tid) for tid in added_vocab.values())
+        except Exception:
+            pass
 
     return torch.tensor(sorted(banned_ids), dtype=torch.long)
 
@@ -351,8 +377,13 @@ def make_first_token_capitalized_logits_hook(
     def logits_hook(step, x_t, logits):
         # logits: [batch, seq_len, vocab]
         if logits.size(1) > 0:
+            # Pad allowed_mask if model vocab > tokenizer vocab
+            mask = allowed_mask.to(logits.device)
+            if mask.size(0) < logits.size(2):
+                pad = torch.zeros(logits.size(2) - mask.size(0), dtype=torch.bool, device=logits.device)
+                mask = torch.cat([mask, pad])
             # Ban all tokens that are not in the allowed list for the first position
-            logits[:, 0, ~allowed_mask.to(logits.device)] = float("-inf")
+            logits[:, 0, ~mask] = float("-inf")
         return logits
 
     return logits_hook
@@ -365,6 +396,29 @@ def make_ban_tokens_logits_hook(banned_token_ids: torch.LongTensor):
     def logits_hook(step, x_t, logits):
         # logits: [batch, seq_len, vocab]
         logits[:, :, banned_token_ids.to(logits.device)] = float("-inf")
+        return logits
+
+    return logits_hook
+
+
+def make_position_ban_logits_hook(position_banned_tokens: dict):
+    """
+    Returns a logits hook that bans specific token IDs at specific sequence positions only.
+    Args:
+        position_banned_tokens: dict mapping sequence position (int) -> set of token IDs to ban at that position.
+    """
+    # Pre-compute tensors for efficient masking
+    positions = []
+    token_ids = []
+    for pos, tids in position_banned_tokens.items():
+        for tid in tids:
+            positions.append(pos)
+            token_ids.append(tid)
+
+    def logits_hook(step, x_t, logits):
+        # logits: [batch, seq_len, vocab]
+        for pos, tid in zip(positions, token_ids):
+            logits[:, pos, tid] = float("-inf")
         return logits
 
     return logits_hook
@@ -456,7 +510,8 @@ def unmask_batch_dream(
     attention_tensor: torch.Tensor,                # [num_runs, seq_len]
     substitutions_old: torch.LongTensor,           # [num_runs, max_masks, 4]
     pipeline: transformers.pipelines.fill_mask.FillMaskPipeline,
-    illegal_tokens: Optional[torch.LongTensor] = None,  # Additional tokens to ban for this call
+    illegal_tokens: Optional[torch.LongTensor] = None,  # Additional tokens to ban globally
+    position_banned_tokens: Optional[dict] = None,  # Per-position bans: {seq_pos: {token_id, ...}}
 ):
     """
     Perform masked unmasking using Dream diffusion model within a FillMaskPipeline.
@@ -495,13 +550,24 @@ def unmask_batch_dream(
 
     banned_ids = pipeline._banned_ids
     
-    # Merge with additional illegal tokens if provided
+    # Merge with additional global illegal tokens if provided
     if illegal_tokens is not None and illegal_tokens.numel() > 0:
-        # Concatenate and get unique IDs
         banned_ids = torch.cat([banned_ids.to(illegal_tokens.device), illegal_tokens]).unique()
-        print(f"  Banning {illegal_tokens.numel()} additional token(s) for this attempt.")
+        print(f"  Banning {illegal_tokens.numel()} additional token(s) globally.")
     
     logits_hook = make_ban_tokens_logits_hook(banned_ids)
+
+    # Add per-position token bans (e.g. ban original token only at its masked position)
+    if position_banned_tokens is not None and len(position_banned_tokens) > 0:
+        pos_hook = make_position_ban_logits_hook(position_banned_tokens)
+        _base_hook = logits_hook
+        def _wrap_pos(step, x_t, logits):
+            logits = _base_hook(step, x_t, logits)
+            logits = pos_hook(step, x_t, logits)
+            return logits
+        logits_hook = _wrap_pos
+        n_pos_bans = sum(len(v) for v in position_banned_tokens.values())
+        print(f"  Banning {n_pos_bans} token(s) at {len(position_banned_tokens)} specific position(s).")
 
     # Optionally enforce that the first token starts with an uppercase ASCII letter.
     generation_logits_hook_func = logits_hook
@@ -525,6 +591,10 @@ def unmask_batch_dream(
     masked_token_tensor = masked_token_tensor.clone()
     masked_token_tensor[masked_token_tensor < 0] = tok.mask_token_id
 
+    # Number of diffusion steps = number of masked tokens (no wasted forward passes)
+    n_masked = int((masked_token_tensor == tok.mask_token_id).sum().item())
+    n_steps = max(n_masked, 1)  # at least 1 step
+
     # --- run Dream diffusion ---
     # diffusion_generate_infilling is already bound to model in CustomUnmasker.__init__
     output = model.diffusion_generate_infilling(
@@ -533,7 +603,7 @@ def unmask_batch_dream(
         max_length=seq_len,
         output_history=True,
         return_dict_in_generate=True,
-        steps=masked_token_tensor.shape[1],#max(1, int(mask_frac * seq_len)),  # ensure at least 1 step
+        steps=n_steps,
         temperature=1.0,
         top_p=0.95,
         alg="origin",

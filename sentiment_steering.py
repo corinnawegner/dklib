@@ -123,25 +123,20 @@ def _validate_sentiment(
     # Get sentiment probabilities
     sentiment_vector = _compute_sentiment_vector(text, sentiment_tokenizer, sentiment_model, device=device)
 
-    # ---- Map model output to (neg, neu, pos) ----
-    if hasattr(sentiment_model.config, "id2label"):
-        labels = [sentiment_model.config.id2label[i].upper() for i in range(len(sentiment_vector))]
-        score_neg = sentiment_vector[labels.index("NEGATIVE")]
-        score_pos = sentiment_vector[labels.index("POSITIVE")]
-        score_neu = sentiment_vector[labels.index("NEUTRAL")]
-    else:
-        # Default fallback: 2-class siebert model
+    # ---- Look up target label in model's id2label, case-insensitively ----
+    if not hasattr(sentiment_model.config, "id2label"):
         raise ValueError("Sentiment model config does not have id2label mapping.")
 
-    # ---- Compute neutral-aware sentiment score ----
-    if sentiment_target in ["POSITIVE", "positive", "POS", "Positive", "pos",'1', "P", "p"]:
-        score = score_pos
-    elif sentiment_target in ["NEGATIVE", "negative", "NEG", "Negative", "neg", '-1', "N", "n"]:
-        score = score_neg
-    elif sentiment_target in ["NEUTRAL", "neutral", "NEU", "Neutral", "neu", '0']:
-        score = score_neu
-    else:
-        raise ValueError("Invalid sentiment_target. Must be 'POSITIVE', 'NEGATIVE', or 'NEUTRAL'.")
+    labels = [sentiment_model.config.id2label[i].upper() for i in range(len(sentiment_vector))]
+    target_upper = sentiment_target.upper()
+
+    if target_upper not in labels:
+        raise ValueError(
+            f"Sentiment target '{sentiment_target}' not found in model labels. "
+            f"Available labels: {labels}"
+        )
+
+    score = sentiment_vector[labels.index(target_upper)]
 
     if previous_score is None:
         return False, score
