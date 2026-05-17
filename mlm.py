@@ -54,8 +54,8 @@ def _unmask_dispatch(
     ALWAYS returns `substitutions`.
     """
 
-    if pipeline.model_name.startswith("Dream-org/Dream"):
-        # Dream helper returns (tokens, substitutions)
+    if pipeline.model_name.startswith("inclusionAI/LLaDA") or pipeline.model_name.startswith("Dream-org/Dream"):
+        # Diffusion infilling helper returns (tokens, substitutions).
         new_tokens, substitutions = unmask_batch_dream(
             masked_token_tensor,
             attention_tensor,

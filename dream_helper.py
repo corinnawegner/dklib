@@ -1,16 +1,20 @@
+"""
+Masked-diffusion unmasking helper.
+
+Originally written for the Dream-org/Dream diffusion model. On the
+``corinna_llaada`` branch this has been ported to the LLaDA-MoE diffusion LM
+(``inclusionAI/LLaDA-MoE-7B-A1B-Base``). Public symbol names
+(``CustomUnmasker``, ``unmask_batch_dream``, ``build_dream_substitutions``)
+are kept for backward compatibility with existing call sites and notebooks.
+"""
 import types
 import torch
+import torch.nn.functional as F
 from typing import Optional, Union, Set, Callable, Iterable
 import math
 import random
 import transformers
 from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
-from dream_model.modeling_dream import DreamModel
-from dream_model.generation_utils import (
-    DreamGenerationConfig,
-    DreamModelOutput,
-    sample_tokens
-)
 import logging
 from .sentiment_steering import (
     _init_sentiment_model,
@@ -24,25 +28,51 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
 # --------------------------------------------------
-# Custom Dream Model
+# LLaDA-MoE constants
 # --------------------------------------------------
-class CustomDreamModel(DreamModel):
+# Mask token id used by the LLaDA-MoE-7B-A1B tokenizer (see model card).
+# The tokenizer does not always advertise ``mask_token_id`` so we fall back
+# to this value if needed.
+_LLADA_MOE_MASK_ID = 156895
+_LLADA_MOE_MASK_STRING = "<|mask|>"  # display string only; not relied on by infill loop
+
+
+class _InfillResult:
+    """Lightweight stand-in for the Dream `DreamModelOutput`/HF GenerateOutput.
+
+    Exposes ``.sequences`` (B, L) and optionally ``.history`` (list of B, L
+    tensors) so that downstream code in :func:`unmask_batch_dream` and
+    :func:`build_dream_substitutions` keeps working unchanged.
     """
-    Subclass of DreamModel allowing:
-      - Binding custom diffusion_generate_infilling method
-      - Token banning and grammar checking
+    def __init__(self, sequences: torch.Tensor, history: Optional[list] = None):
+        self.sequences = sequences
+        self.history = history if history is not None else []
+
+
+def _ensure_mask_token(tokenizer: PreTrainedTokenizerBase) -> int:
+    """Make sure ``tokenizer.mask_token_id`` is set for LLaDA-MoE.
+
+    The LLaDA-MoE tokenizer does not register a HuggingFace-style mask token
+    out of the box. We patch it in so that the rest of the pipeline (which
+    consistently uses ``tokenizer.mask_token_id``) works without changes.
+    Returns the resolved mask token id.
     """
-    def __init__(self, config, tokenizer=None, grammar_checker: Optional[Callable] = None):
-        super().__init__(config)
-        self.tokenizer = tokenizer  # optional tokenizer reference
-        self.grammar_checker = grammar_checker
-        self._banned_ids = None  # can be set later
-        self._first_token_banned_ids = None
-        
-        # Bind diffusion_generate_infilling method to this model instance
-        self.diffusion_generate_infilling = types.MethodType(
-            _diffusion_generate_infilling_impl, self
-        )
+    mid = getattr(tokenizer, "mask_token_id", None)
+    if mid is None:
+        # Try to look up the default LLaDA-MoE mask id in the vocabulary.
+        mid = _LLADA_MOE_MASK_ID
+        try:
+            tokenizer.mask_token = tokenizer.convert_ids_to_tokens(mid)
+        except Exception:
+            tokenizer.mask_token = _LLADA_MOE_MASK_STRING
+        # Setting mask_token recomputes mask_token_id but only if the string
+        # exists in the vocab; force it explicitly.
+        try:
+            tokenizer.mask_token_id = mid
+        except Exception:
+            pass
+    return int(tokenizer.mask_token_id)
+
 
 # ============================================================================
 # GRAMMAR CHECKING
@@ -105,27 +135,36 @@ class CustomUnmasker:
         
         # Determine model path: use local path if provided, otherwise use model_name from HuggingFace
         if local_model_path is not None:
-            # Load from local submodule
+            # Load from local directory
             import os
             if not os.path.exists(local_model_path):
                 raise FileNotFoundError(f"Local model path does not exist: {local_model_path}")
             model_path = local_model_path
-            print(f"Loading Dream model from local path: {model_path}")
+            print(f"Loading LLaDA-MoE model from local path: {model_path}")
         else:
             # Load from HuggingFace Hub
             model_path = model_name
-            print(f"Loading Dream model from HuggingFace Hub: {model_path}")
+            print(f"Loading LLaDA-MoE model from HuggingFace Hub: {model_path}")
         
-        # Load tokenizer
+        # Load tokenizer (LLaDA-MoE requires trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        
-        # Load model using CustomDreamModel (diffusion_generate_infilling is bound in __init__)
-        self.model = CustomDreamModel.from_pretrained(
+        _ensure_mask_token(self.tokenizer)
+
+        # Load model. LLaDA-MoE is a masked-diffusion LM exposed via AutoModel
+        # with custom remote code.
+        self.model = AutoModel.from_pretrained(
             model_path,
             torch_dtype=dtype,
             trust_remote_code=True,
-            tokenizer=self.tokenizer,
         ).to(device)
+        # Attach tokenizer + bind the masked-infill diffusion loop directly
+        # onto the model instance so we can call
+        # ``model.diffusion_generate_infilling(...)`` like the original Dream
+        # code did.
+        self.model.tokenizer = self.tokenizer
+        self.model.diffusion_generate_infilling = types.MethodType(
+            _diffusion_generate_infilling_impl, self.model
+        )
 
         self.model_name = model_name
         self.sentiment_model_name = sentiment_model
@@ -147,64 +186,149 @@ class CustomUnmasker:
                 )
             self.sentiment_model = self.sentiment_model.to(device)
             
+def _add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Gumbel-noise reparameterisation used by LLaDA's reference sampler."""
+    if temperature == 0:
+        return logits
+    logits64 = logits.to(torch.float64)
+    noise = torch.rand_like(logits64, dtype=torch.float64)
+    gumbel_noise = (-torch.log(noise)) ** temperature
+    return logits64.exp() / gumbel_noise
+
+
+def _get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
+    """Distribute the number of mask positions to transfer over `steps` steps.
+
+    Mirrors ``get_num_transfer_tokens`` from the LLaDA-MoE README.
+    Returns a tensor of shape (B, steps) with non-negative integers that sum
+    (per row) to the total number of masked positions in that row.
+    """
+    mask_num = mask_index.sum(dim=1, keepdim=True)
+    base = mask_num // steps
+    remainder = mask_num % steps
+    num_transfer_tokens = (
+        torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64)
+        + base
+    )
+    for i in range(mask_num.size(0)):
+        num_transfer_tokens[i, :remainder[i]] += 1
+    return num_transfer_tokens
+
+
+@torch.no_grad()
 def _diffusion_generate_infilling_impl(
     self,
     token_tensor: torch.LongTensor,
     attention_tensor: Optional[torch.LongTensor] = None,
-    generation_config: Optional["DreamGenerationConfig"] = None,
+    generation_config=None,  # accepted for API compat; unused for LLaDA
     **kwargs,
 ):
-    """
-    Custom diffusion_generate that performs masked infilling.
-    This function is bound to CustomDreamModel instances in CustomDreamModel.__init__.
-    """
-    generation_config = self._prepare_generation_config(generation_config, **kwargs)
+    """Masked-infilling diffusion generation for LLaDA-MoE.
 
-    # Use caller-provided logits hook if supplied (it already includes
-    # general token bans, per-position bans, and capitalisation);
-    # otherwise fall back to the default banned-token hook.
-    if "generation_logits_hook_func" in kwargs and kwargs["generation_logits_hook_func"] is not None:
-        generation_logits_hook_func = kwargs["generation_logits_hook_func"]
-    else:
+    Bound to the loaded model instance in :class:`CustomUnmasker`. Mirrors the
+    public surface previously offered by the Dream model so that
+    :func:`unmask_batch_dream` (and the rest of the pipeline) does not need to
+    change.
+
+    Recognised ``kwargs``:
+        * ``steps`` (int, optional): number of diffusion steps. Defaults to
+          the number of masked tokens (= one new token per step).
+        * ``temperature`` (float, default 0.0): Gumbel-noise temperature.
+        * ``generation_logits_hook_func`` (callable, optional): called as
+          ``hook(step, x_t, logits)`` and may modify the logits in-place.
+        * ``output_history`` (bool, default False): record per-step state.
+        * ``return_dict_in_generate`` (bool, default False): kept for API
+          compatibility (we always return a result object).
+
+    Dream-specific kwargs (``top_p``, ``alg``, ``alg_temp``, ``max_length``,
+    ``pad_token_id``) are accepted but ignored.
+    """
+    steps_arg = kwargs.get("steps", None)
+    temperature = float(kwargs.get("temperature", 0.0))
+    output_history = bool(kwargs.get("output_history", False))
+    logits_hook = kwargs.get("generation_logits_hook_func", None)
+
+    if logits_hook is None:
+        # Default hook: ban non-prose tokens (matches the original Dream
+        # fallback behaviour).
         banned_token_ids = compute_banned_token_ids(self.tokenizer)
-        generation_logits_hook_func = make_ban_tokens_logits_hook(banned_token_ids)
+        logits_hook = make_ban_tokens_logits_hook(banned_token_ids)
 
-    input_ids = token_tensor
-    attention_mask = attention_tensor
-    device = input_ids.device
-    self._prepare_special_tokens(generation_config, device=device)
+    mask_id = _ensure_mask_token(self.tokenizer)
+    device = token_tensor.device
 
-    input_ids_length = input_ids.shape[-1]
-    has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
-    generation_config = self._prepare_generated_length(
-        generation_config=generation_config,
-        has_default_max_length=has_default_max_length,
-        input_ids_length=input_ids_length,
-    )
+    x = token_tensor.clone()
+    # Replace any negative sentinel values with the mask id (defensive: the
+    # caller in unmask_batch_dream already does this, but keep it here too).
+    x[x < 0] = mask_id
 
-    max_length = generation_config.max_length
-    mask_token_id = generation_config.mask_token_id
-    pad_token_id = generation_config.pad_token_id
+    initial_mask_index = (x == mask_id)
+    n_masked = int(initial_mask_index.sum(dim=1).max().item())
 
-    # Pad if needed
-    if input_ids_length < max_length:
-        pad_len = max_length - input_ids_length
-        pad_token = torch.full((input_ids.size(0), pad_len), pad_token_id, dtype=torch.long, device=device)
-        input_ids = torch.cat([input_ids, pad_token], dim=-1)
-        if attention_mask is not None:
-            pad_mask = torch.ones((attention_mask.size(0), pad_len), dtype=attention_mask.dtype, device=device)
-            attention_mask = torch.cat([attention_mask, pad_mask], dim=-1)
+    if steps_arg is None:
+        steps = max(n_masked, 1)
+    else:
+        steps = max(int(steps_arg), 1)
 
-    # Skip expand — we want single completion
-    result = self._sample(
-        input_ids,
-        attention_mask=attention_mask,
-        generation_config=generation_config,
-        generation_logits_hook_func=generation_logits_hook_func,
-        generation_tokens_hook_func = lambda step, x_t, logits: x_t # Pass the missing argument
-    )
+    # Schedule of how many tokens to commit per step (per batch row).
+    num_transfer_tokens = _get_num_transfer_tokens(initial_mask_index, steps).to(device)
 
-    return result
+    history = [x.clone()] if output_history else None
+
+    for step in range(steps):
+        mask_index = (x == mask_id)
+        if not mask_index.any():
+            break
+
+        # Forward pass through the LLaDA-MoE model. AutoModel returns an
+        # object with a ``.logits`` attribute.
+        outputs = self(x, attention_mask=attention_tensor)
+        logits = outputs.logits
+
+        # Apply caller-provided logits constraints (token bans, capitalised
+        # first token, per-position bans, ...).
+        logits = logits_hook(step, x, logits)
+
+        # Sample candidate tokens for every position.
+        if temperature == 0:
+            x0 = torch.argmax(logits, dim=-1)
+        else:
+            noisy = _add_gumbel_noise(logits, temperature)
+            x0 = torch.argmax(noisy, dim=-1)
+
+        # Confidence = softmax probability of the chosen token, computed on
+        # the (already constrained) logits so that banned tokens have zero
+        # probability and never get selected for transfer.
+        probs = F.softmax(logits.to(torch.float32), dim=-1)
+        x0_conf = torch.gather(probs, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+
+        # Only consider currently-masked positions; keep prompt tokens fixed.
+        x0 = torch.where(mask_index, x0, x)
+        confidence = torch.where(
+            mask_index,
+            x0_conf,
+            torch.full_like(x0_conf, float("-inf")),
+        )
+
+        # Transfer the top-k highest-confidence positions per row.
+        transfer_index = torch.zeros_like(x, dtype=torch.bool)
+        for b in range(x.size(0)):
+            k = int(num_transfer_tokens[b, step].item())
+            if k <= 0:
+                continue
+            # Cap k at the number of remaining masked positions for safety.
+            k = min(k, int(mask_index[b].sum().item()))
+            if k <= 0:
+                continue
+            _, top_idx = torch.topk(confidence[b], k=k)
+            transfer_index[b, top_idx] = True
+
+        x = torch.where(transfer_index, x0, x)
+
+        if output_history:
+            history.append(x.clone())
+
+    return _InfillResult(sequences=x, history=history if output_history else [])
 
 def compute_banned_token_ids(
     tokenizer: PreTrainedTokenizerBase,
