@@ -340,6 +340,8 @@ def compute_banned_token_ids(
     allow_only_alpha: bool = False,
     require_real_word: bool = False,
     strict_real_word: bool = False,  # New flag for stricter real-word enforcement
+    ban_repeated_punctuation: bool = False,  # Ban tokens that are 2+ repeated punctuation chars
+    ban_crosslingual: bool = False,  # Ban tokens containing non-ASCII characters
 ) -> torch.LongTensor:
     """
     Scan tokenizer vocabulary and return token IDs that should be banned
@@ -369,7 +371,8 @@ def compute_banned_token_ids(
             "Ã", "#", "*",
             "Ĺ", "â","Ģ","¢","Ė","Ī","Ļ","Ĳ","Ď","Ė","Ē",
               "Ŀ","Ń","Ņ","Ŋ","Ŕ","Ŗ","Ş","Ť","Ŧ","Ũ","Ū","Ŭ","Ů","Ű","Ų", "Ŵ","Ŷ","Ÿ","Ź","Ż","Ž", "Ġ", "[","]",
-              "<", ">", "{","}","%","^","*","_","+","=","\\","|","~","`", ".\n", "?\n",",\n","!\n", ":\n", ",\n" ,";\n", ")\n"
+              "<", ">", "{","}","%","^","*","_","+","=","\\","|","~","`", ".\n", "?\n",",\n","!\n", ":\n", ",\n" ,";\n", ")\n",
+              "/", "@", "$", "&"
         }
 
     banned_ids: Set[int] = set()
@@ -445,6 +448,20 @@ def compute_banned_token_ids(
         # Rule 6: strict_real_word — ban subwords or compound tokens
         if strict_real_word:
             if token_str.startswith("##") or " " in token_str:
+                banned_ids.add(token_id)
+                continue
+
+        # Rule 7: ban_repeated_punctuation — ban tokens whose non-space content
+        # is 2+ punctuation characters (e.g. ',,', '..', '.,', '.,' etc.)
+        if ban_repeated_punctuation:
+            puncts = [c for c in normalized if not c.isalnum() and not c.isspace()]
+            if len(puncts) >= 2:
+                banned_ids.add(token_id)
+                continue
+
+        # Rule 8: ban_crosslingual — ban tokens with any non-ASCII character
+        if ban_crosslingual:
+            if any(ord(c) > 127 for c in normalized):
                 banned_ids.add(token_id)
                 continue
 
@@ -663,13 +680,17 @@ def unmask_batch_dream(
         allow_alpha = getattr(pipeline, "_allow_only_alpha", False)
         allow_nums = getattr(pipeline, "_allow_numbers", False)
         require_words = getattr(pipeline, "_require_real_word", False)
-        strict_words = getattr(pipeline, "_strict_real_word", False)  # Retrieve the strict_real_word flag
+        strict_words = getattr(pipeline, "_strict_real_word", False)
+        ban_rep_punc = getattr(pipeline, "_ban_repeated_punctuation", False)
+        ban_xlang = getattr(pipeline, "_ban_crosslingual", False)
         pipeline._banned_ids = compute_banned_token_ids(
             tok,
             allow_only_alpha=allow_alpha,
             allow_numbers=allow_nums,
             require_real_word=require_words,
-            strict_real_word=strict_words,  # Pass the flag to the function
+            strict_real_word=strict_words,
+            ban_repeated_punctuation=ban_rep_punc,
+            ban_crosslingual=ban_xlang,
         )
 
     banned_ids = pipeline._banned_ids
