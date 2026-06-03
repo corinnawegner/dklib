@@ -388,14 +388,13 @@ def mask_unmask_monte_batch(
                 mask_frac=num_masks if num_masks < 1 else None,
             )
 
-    elif pipeline.model_name.startswith("Dream-org/Dream"):
+    elif pipeline.model_name.startswith("Dream-org/Dream") or pipeline.model_name.startswith("inclusionAI/LLaDA"):
         _unmask_dispatch(
             masked_token_tensor,
             attention_tensor,
             substitutions,
             pipeline,
             rng=None,
-
         )
 
     outputs = [substitutions]
@@ -421,7 +420,7 @@ def mask_unmask_monte_sequential(
     If grammar or sentiment validation is enabled and fails, re-runs unmasking with the same
     masked input (up to max_retries).
     """
-    from dklib.dream_helper import _validate_grammar, _validate_sentiment, _init_grammar_checker
+    from dklib.dream_helper import _validate_grammar, _validate_sentiment, _init_grammar_checker, _validate_perplexity
     
     # --- prepare initial masked sentence---
     masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch(
@@ -437,6 +436,7 @@ def mask_unmask_monte_sequential(
     # Get validation settings
     validate_grammar = getattr(pipeline, "_validate_grammar", False)
     sample_sentiment = getattr(pipeline, "_sample_sentiment", False)
+    validate_perplexity = getattr(pipeline, "_validate_perplexity", False)
     max_unmasking_retries = getattr(pipeline, "_validation_max_retries", 5)
     
     # Initialize grammar checker if needed
@@ -465,6 +465,25 @@ def mask_unmask_monte_sequential(
             previous_score = 10e-12
         )
 
+    # Compute baseline perplexity for the original paragraph (only when sentiment steering is also active)
+    if sample_sentiment and validate_perplexity:
+        perplexity_tokenizer = getattr(pipeline, "perplexity_tokenizer", None)
+        perplexity_model_obj = getattr(pipeline, "perplexity_model", None)
+        alpha_perplexity = getattr(pipeline, "_alpha_perplexity", 1.0)
+        tokenized = pipeline.tokenizer([text], padding=True)
+        token_tensor = torch.tensor(
+            tokenized["input_ids"], dtype=torch.int64, device=pipeline.device
+        )
+        _, current_ppl = _validate_perplexity(
+            token_tensor,
+            pipeline.tokenizer,
+            perplexity_tokenizer,
+            perplexity_model_obj,
+            device=pipeline.device,
+            previous_ppl=None,
+            alpha_perplexity=alpha_perplexity,
+        )
+
     fail_counter = 0
 
     # Initialize last_validated_tokens with the original (unmasked) sentence
@@ -489,7 +508,7 @@ def mask_unmask_monte_sequential(
         position_banned_tokens = None
 
         # Unmask
-        if pipeline.model_name.startswith("Dream-org/Dream"):
+        if pipeline.model_name.startswith("Dream-org/Dream") or pipeline.model_name.startswith("inclusionAI/LLaDA"):
             #print(f"Using Dream unmasking... (attempt {unmasking_attempt + 1}/{max_unmasking_retries})")
             unmasked_tokens, step_subs = _unmask_dispatch(
                 step_tokens,
@@ -510,6 +529,10 @@ def mask_unmask_monte_sequential(
                     substitution_step=step,
                     T=T,
                 )
+            # step_tokens is updated in-place by unmask_batch; expose it as
+            # unmasked_tokens so the code below (which is shared with the
+            # Dream path) can use it unconditionally.
+            unmasked_tokens = step_tokens.clone()
 
         # Given the filled substitution tensor, update masked_token_tensor with the unmasked token ids
         apply_substitutions(step_tokens, step_subs, state="final")
@@ -571,7 +594,25 @@ def mask_unmask_monte_sequential(
                 )
 
                 if validation_passed: # If the sentiment validation passed, update the sentiment score
-                    new_score = sentiment_score                  
+                    new_score = sentiment_score
+
+        # Check perplexity if enabled – only when sentiment steering is active
+        if sample_sentiment and validate_perplexity and validation_passed:
+            if perplexity_tokenizer is not None and perplexity_model_obj is not None:
+                print(f"Checking perplexity...")
+                ppl_passed, new_ppl = _validate_perplexity(
+                    unmasked_tokens,
+                    pipeline.tokenizer,
+                    perplexity_tokenizer,
+                    perplexity_model_obj,
+                    device=step_tokens.device,
+                    previous_ppl=current_ppl,
+                    alpha_perplexity=alpha_perplexity,
+                )
+                if ppl_passed:
+                    current_ppl = new_ppl
+                else:
+                    validation_passed = False
 
         if not validation_passed:
             fail_counter += 1

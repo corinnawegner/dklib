@@ -163,3 +163,123 @@ def _validate_sentiment(
             print(f"  Sentiment did not improve: Rejected score ({score:.4f}) < Previous score {previous_score:.4f}.")
             return False, previous_score
 
+
+# ============================================================================
+# PERPLEXITY STEERING
+# ============================================================================
+
+def _init_perplexity_model(perplexity_model_name: str = "gpt2", validate_perplexity: Optional[bool] = None):
+    """
+    Initialize a causal LM for perplexity computation.
+
+    Args:
+        perplexity_model_name: HuggingFace model name (default: "gpt2").
+        validate_perplexity: If True and model fails to load, terminate.
+
+    Returns:
+        tuple[tokenizer, model] or (None, None) on failure.
+    """
+    if validate_perplexity is None:
+        validate_perplexity = False
+
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+
+        tokenizer = AutoTokenizer.from_pretrained(perplexity_model_name)
+        model = AutoModelForCausalLM.from_pretrained(perplexity_model_name)
+        model.eval()
+        print(f"Loaded perplexity model: {perplexity_model_name}")
+        return tokenizer, model
+    except Exception as e:
+        print(f"Error: Failed to load perplexity model: {e}")
+        if validate_perplexity:
+            print("Perplexity validation is active but the model failed to load. Terminating job.")
+            import sys
+            sys.exit(1)
+        return None, None
+
+
+def _compute_perplexity(
+    text: str,
+    perplexity_tokenizer,
+    perplexity_model,
+    device: torch.device = torch.device("cpu"),
+    max_length: int = 1024,
+) -> float:
+    """
+    Compute the perplexity of *text* under a causal language model.
+
+    Tokens that exceed *max_length* are silently truncated.
+
+    Returns:
+        float: Perplexity (≥ 1).  Lower means more fluent / natural text.
+    """
+    inputs = perplexity_tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+    ).to(device)
+    input_ids = inputs["input_ids"]
+
+    if input_ids.shape[1] < 2:
+        # Too short to compute a meaningful CE; return a neutral value
+        return 1.0
+
+    with torch.no_grad():
+        outputs = perplexity_model(**inputs, labels=input_ids)
+        # outputs.loss is mean cross-entropy over tokens
+        loss = outputs.loss.item()
+
+    return math.exp(loss)
+
+
+def _validate_perplexity(
+    final_tokens: torch.LongTensor,
+    tokenizer: PreTrainedTokenizerBase,
+    perplexity_tokenizer,
+    perplexity_model,
+    device: torch.device = torch.device("cpu"),
+    previous_ppl: Optional[float] = None,
+    alpha_perplexity: float = 1.0,
+) -> tuple[bool, float]:
+    """
+    Strict acceptance test based on causal-LM perplexity.
+
+    Lower perplexity = more fluent text. A proposal is accepted only when
+    its perplexity is no worse than the previously accepted state.
+
+    Args:
+        final_tokens: [1, L] or [B, L] token-ID tensor (batch must be 1 for now).
+        tokenizer: Diffusion-model tokenizer (used only to decode the text).
+        perplexity_tokenizer: Tokenizer for the causal LM.
+        perplexity_model: Causal LM.
+        device: Torch device.
+        previous_ppl: Perplexity of the previous accepted state.
+                      If None, accept unconditionally and return the current ppl.
+        alpha_perplexity: Unused compatibility argument retained so existing
+                          callers do not need to change.
+
+    Returns:
+        tuple[bool, float]: (accepted, current_perplexity)
+    """
+    text = tokenizer.decode(final_tokens.view(-1).tolist(), skip_special_tokens=True)
+    print(f"  Evaluating perplexity for text: \n {text}")
+
+    current_ppl = _compute_perplexity(text, perplexity_tokenizer, perplexity_model, device=device)
+    print(f"  Perplexity: {current_ppl:.2f}" + (f" (previous: {previous_ppl:.2f})" if previous_ppl is not None else ""))
+
+    if previous_ppl is None:
+        # First evaluation – accept unconditionally, record baseline
+        return False, current_ppl
+
+    if current_ppl <= previous_ppl:
+        print(f"  Perplexity improved: {current_ppl:.2f} ≤ {previous_ppl:.2f}. ✓")
+        return True, current_ppl
+
+    print(
+        f"  Perplexity worsened and rejected: "
+        f"ppl {current_ppl:.2f} > {previous_ppl:.2f}."
+    )
+    return False, previous_ppl
+

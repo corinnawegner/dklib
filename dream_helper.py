@@ -20,7 +20,10 @@ from .sentiment_steering import (
     _init_sentiment_model,
     _compute_sentiment_vector,
     _compute_sentiment_score,
-    _validate_sentiment
+    _validate_sentiment,
+    _init_perplexity_model,
+    _compute_perplexity,
+    _validate_perplexity,
 )
 
 # Configure logger
@@ -129,7 +132,7 @@ def _init_grammar_checker(method: str = "gpt"):
 
 
 class CustomUnmasker:
-    def __init__(self, model_name: str, device: int = 0, sentiment_model: Optional[str] = None, dtype=torch.bfloat16, local_model_path: Optional[str] = None):
+    def __init__(self, model_name: str, device: int = 0, sentiment_model: Optional[str] = None, dtype=torch.bfloat16, local_model_path: Optional[str] = None, perplexity_model: Optional[str] = None, alpha_perplexity: float = 1.0):
         self._remote_code = True
         self.device = device
         
@@ -185,7 +188,27 @@ class CustomUnmasker:
                     f"AutoModelForSequenceClassification.from_pretrained('{self.sentiment_model_name}')\""
                 )
             self.sentiment_model = self.sentiment_model.to(device)
-            
+
+        # Initialize perplexity model (optional, for perplexity-guided steering)
+        self.perplexity_model_name = perplexity_model
+        self.perplexity_model = None
+        self.perplexity_tokenizer = None
+        self._alpha_perplexity = alpha_perplexity
+
+        if self.perplexity_model_name is not None:
+            self._validate_perplexity = True
+            self.perplexity_tokenizer, self.perplexity_model = _init_perplexity_model(
+                self.perplexity_model_name, validate_perplexity=True
+            )
+            if self.perplexity_model is None:
+                raise RuntimeError(
+                    f"Perplexity model '{self.perplexity_model_name}' failed to load."
+                )
+            self.perplexity_model = self.perplexity_model.to(device)
+        else:
+            self._validate_perplexity = False
+
+
 def _add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     """Gumbel-noise reparameterisation used by LLaDA's reference sampler."""
     if temperature == 0:
@@ -247,6 +270,13 @@ def _diffusion_generate_infilling_impl(
     temperature = float(kwargs.get("temperature", 0.0))
     output_history = bool(kwargs.get("output_history", False))
     logits_hook = kwargs.get("generation_logits_hook_func", None)
+
+    # Callers (e.g. unmask_batch_dream) pass the attention mask as
+    # ``attention_mask=`` (the canonical HuggingFace kwarg name) rather than
+    # the positional ``attention_tensor`` parameter, so it ends up in **kwargs.
+    # Pick it up here so the model forward pass actually sees it.
+    if attention_tensor is None:
+        attention_tensor = kwargs.get("attention_mask", None)
 
     if logits_hook is None:
         # Default hook: ban non-prose tokens (matches the original Dream
