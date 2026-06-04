@@ -4,11 +4,12 @@ from typing import Optional, Union, Set, Callable
 import transformers
 from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 from dream_model.generation_utils import (
-    DreamModel,
     DreamGenerationConfig,
     DreamModelOutput,
     sample_tokens
 )
+from dream_model.modeling_dream import DreamModel
+from dklib.banned_tokens import compute_banned_token_ids
 
 
 # --------------------------------------------------
@@ -126,7 +127,7 @@ def _init_grammar_checker(method: str = "gpt"):
 
 
 class CustomUnmasker:
-    def __init__(self, model_name: str, device: int = 0, dtype=torch.bfloat16, local_model_path: Optional[str] = None):
+    def __init__(self, model_name: str, device: int = 0, dtype=torch.bfloat16, local_model_path: Optional[str] = None, sentiment_model: Optional[str] = None, perplexity_model: Optional[str] = None, alpha_perplexity: float = 1.0):
         self._remote_code = True
         self.device = device
         
@@ -232,129 +233,6 @@ def diffusion_generate_infilling(
 
     return result
 
-
-from typing import Iterable, Set
-import torch
-from transformers import PreTrainedTokenizerBase
-
-def compute_banned_token_ids(
-    tokenizer: PreTrainedTokenizerBase,
-    *,
-    allow_numbers: bool = False,
-    allowed_symbols: Optional[Set[str]] = None,
-    ban_special_tokens: bool = True,
-    extra_banned_strings: Optional[Set[str]] = None,
-    allow_only_alpha: bool = False,
-    require_real_word: bool = False,
-) -> torch.LongTensor:
-    """
-    Scan tokenizer vocabulary and return token IDs that should be banned
-    during generation (non-prose tokens + optionally special tokens + explicit strings).
-
-    Parameters:
-      - allow_only_alpha: when True, tokens that do not consist only of letters (after
-        stripping common tokenization prefixes) are banned.
-      - require_real_word: when True, tokens must be recognized as real words via
-        'wordfreq' or NLTK 'words' corpus. Single-letter tokens and non-dictionary words
-        are banned. Requires optional dependencies (wordfreq or nltk).
-    """
-
-    if allowed_symbols is None:
-        allowed_symbols = {
-            ".", ",", "!", "?", "'", '"', ":", "-", "(", ")"
-        }
-
-    if extra_banned_strings is None:
-        extra_banned_strings = {
-            "ĊĊ",
-            "Âł",
-            "<br /><br />",
-            "<|beginoftext|>",
-            "Ġ",
-            "\n",
-            "\ ",
-            "\r",
-            ";"
-        }
-
-    banned_ids: Set[int] = set()
-    vocab_size = len(tokenizer)
-
-    # Initialize wordlist for real-word checking if needed
-    word_list = None
-    if require_real_word:
-        try:
-            from wordfreq import word_frequency
-            word_list = 'wordfreq'
-        except ImportError:
-            try:
-                import nltk
-                nltk.download('words', quiet=True)
-                from nltk.corpus import words as nltk_words
-                word_list = set(w.lower() for w in nltk_words.words())
-            except (ImportError, LookupError):
-                print("Warning: require_real_word=True but neither 'wordfreq' nor 'nltk' words corpus available. Skipping real-word check.")
-                require_real_word = False
-
-    # -----------------------
-    # Vocabulary scan rules
-    # -----------------------
-    for token_id in range(vocab_size):
-        token_str = tokenizer.decode([token_id], skip_special_tokens=False)
-
-        # Rule 2: numbers
-        if not allow_numbers and any(c.isdigit() for c in token_str):
-            banned_ids.add(token_id)
-            continue
-
-        normalized = token_str.replace("Ġ", "").replace("▁", "").replace("Ċ", "").strip()
-        # Rule 4: allow_only_alpha — ban tokens that are not pure letters after normalization
-        if allow_only_alpha and (normalized == "" or not normalized.isalpha()):
-            banned_ids.add(token_id)
-            continue
-
-        # Rule 5: require_real_word — ban single letters and non-dictionary words
-        if require_real_word and normalized != "":
-            # Ban single letters
-            if len(normalized) == 1:
-                banned_ids.add(token_id)
-                continue
-            # Check if it's a real word
-            if word_list == 'wordfreq':
-                from wordfreq import word_frequency
-                freq = word_frequency(normalized.lower(), 'en')
-                if freq == 0:
-                    banned_ids.add(token_id)
-                    continue
-            elif isinstance(word_list, set):
-                if normalized.lower() not in word_list:
-                    banned_ids.add(token_id)
-                    continue
-
-    # -----------------------
-    # Rule 6: special tokens
-    # -----------------------
-    if ban_special_tokens:
-        banned_ids.update(tokenizer.all_special_ids)
-
-    # -----------------------
-    # Rule 7: explicit strings
-    # -----------------------
-    for s in extra_banned_strings:
-        token_ids = tokenizer(
-            s,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
-        )["input_ids"]
-
-        for tid in token_ids:
-            banned_ids.add(tid)
-
-    banned_ids = torch.tensor(sorted(banned_ids), dtype=torch.long)
-
-    print(f"Banned {len(banned_ids)} tokens (non-prose + special + explicit).")
-    return banned_ids
 
 def compute_first_token_banned_ids(tokenizer: PreTrainedTokenizerBase) -> torch.LongTensor:
     """Return token ids that SHOULD NOT be used as the very first token of a sentence.
@@ -545,14 +423,17 @@ def unmask_batch_dream(
 
     # compute banned token IDs ONCE — read constraints from pipeline attributes
     if not hasattr(pipeline, "_banned_ids"):
-        allow_alpha = getattr(pipeline, "_allow_only_alpha", False)
-        allow_nums = getattr(pipeline, "_allow_numbers", False)
-        require_words = getattr(pipeline, "_require_real_word", False)
         pipeline._banned_ids = compute_banned_token_ids(
             tok,
-            allow_only_alpha=allow_alpha,
-            allow_numbers=allow_nums,
-            require_real_word=require_words,
+            ban_numbers=getattr(pipeline, "_ban_numbers", True),
+            ban_symbols=getattr(pipeline, "_ban_symbols", True),
+            ban_unicode_artifacts=getattr(pipeline, "_ban_unicode_artifacts", True),
+            ban_special_tokens=getattr(pipeline, "_ban_special_tokens", True),
+            ban_non_alpha=getattr(pipeline, "_ban_non_alpha", False),
+            ban_repeated_punctuation=getattr(pipeline, "_ban_repeated_punctuation", False),
+            ban_crosslingual=getattr(pipeline, "_ban_crosslingual", False),
+            require_real_word=getattr(pipeline, "_require_real_word", False),
+            strict_real_word=getattr(pipeline, "_strict_real_word", False),
         )
 
     banned_ids = pipeline._banned_ids
@@ -633,63 +514,4 @@ def unmask_batch_dream(
     masked_token_tensor[:] = final_tokens
 
     return masked_token_tensor, substitutions_new
-"""
-def compute_banned_token_ids(
-    tokenizer: PreTrainedTokenizerBase,
-    *,
-    allow_numbers: bool = False,
-    allow_newlines: bool = False,
-    allowed_symbols: Optional[Set[str]] = None,
-    ban_special_tokens: bool = True,
-) -> torch.LongTensor:
-"""
-    #Scan tokenizer vocabulary and return token IDs that should be banned
-    #during generation (non-prose tokens + optionally special tokens).
 
-    ##Rules:
-      #- Newlines banned by default
-      #- Numbers banned by default
-      #- Code / non-prose symbols banned
-      #- Special tokens always banned (recommended)
-
-    #Returns:
-     #   torch.LongTensor of banned token IDs
-"""
-
-    if allowed_symbols is None:
-        # Standard English punctuation we allow
-        allowed_symbols = {
-            ".", ",", "!", "?", "'", '"', ";", ":", "-", "(", ")", " "
-        }
-
-    banned_ids: Set[int] = set()
-    vocab_size = len(tokenizer)
-
-    for token_id in range(vocab_size):
-        token_str = tokenizer.decode([token_id], skip_special_tokens=False)
-
-        # --- RULE 1: BAN NEWLINES ---
-        if not allow_newlines and ("\n" in token_str or "\r" in token_str):
-            banned_ids.add(token_id)
-            continue
-
-        # --- RULE 2: BAN NUMBERS ---
-        if not allow_numbers and any(c.isdigit() for c in token_str):
-            banned_ids.add(token_id)
-            continue
-
-        # --- RULE 3: BAN CODE / NON-PROSE SYMBOLS ---
-        for char in token_str:
-            if not char.isalpha() and char not in allowed_symbols:
-                banned_ids.add(token_id)
-                break
-
-    # --- RULE 4: BAN SPECIAL TOKENS (CRITICAL) ---
-    if ban_special_tokens:
-        banned_ids.update(tokenizer.all_special_ids)
-
-    banned_ids = torch.tensor(sorted(banned_ids), dtype=torch.long)
-
-    print(f"Banned {len(banned_ids)} tokens (non-prose + special).")
-    return banned_ids
-"""
