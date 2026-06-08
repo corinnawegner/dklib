@@ -32,7 +32,7 @@ Slurm variable template
   BAN_UNICODE_ARTIFACTS=True
   BAN_NON_ALPHA=False
   BAN_REPEATED_PUNCTUATION=False
-  BAN_CROSSLINGUAL=False
+  BAN_CROSSLINGUAL=True
   REQUIRE_REAL_WORD=False
   STRICT_REAL_WORD=False
 """
@@ -90,7 +90,7 @@ def compute_banned_token_ids(
     # -- Stricter opt-in groups (off by default) --------------------------------
     ban_non_alpha: bool = False,
     ban_repeated_punctuation: bool = False,
-    ban_crosslingual: bool = False,
+    ban_crosslingual: bool = True,
     require_real_word: bool = False,
     strict_real_word: bool = False,
     # -- Fine-grained overrides ------------------------------------------------
