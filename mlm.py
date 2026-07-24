@@ -389,8 +389,8 @@ def mask_unmask_monte_batch(
 
     return tuple(outputs)
 
-def mask_unmask_monte_sequential(
-    text: str,
+def mask_unmask_monte_sequential_batch(
+    texts: list[str],
     sequential_iterations: int,
     pipeline,
     num_masks,
@@ -399,45 +399,61 @@ def mask_unmask_monte_sequential(
     T: float = 1.0,
 ):
     """
-    Performs sequential mask-unmask on a single text, for a given number of iterations.
+    Performs sequential mask-unmask on a batch of texts simultaneously.
+
+    The sequential dependency only runs along the u-turn axis, so at every
+    u-turn all texts are handed to the model in a single batched call
+    (batch size = len(texts)) instead of one model call per text. Texts of
+    different lengths are padded by the tokenizer; padded positions carry
+    attention 0 and are never masked.
+
+    Args:
+        texts (list[str]): The texts to process in parallel. Each text runs
+            its own independent u-turn chain.
+        sequential_iterations (int): Number of u-turns per chain.
+        pipeline: The unmasking pipeline / CustomUnmasker.
+        num_masks (Union[int, float]): Number of masks per u-turn, or masking
+            probability if a float in (0, 1).
+        rng (torch.Generator): Random number generator for the masking draws.
+        T (float): Sampling temperature (non-Dream models only).
+
+    Returns:
+        torch.LongTensor: Substitution record of shape
+        [num_texts, num_uturns, max_masks, 4].
     """
-    # --- prepare initial masked sentence---
+    num_texts = len(texts)
+
+    # One independent masking draw per (text, uturn) pair, exactly as the
+    # single-text version draws one per u-turn.
+    replicated_texts = [text for text in texts for _ in range(sequential_iterations)]
     masked_token_tensor, attention_tensor, substitutions = prepare_masked_batch(
-        [text]*sequential_iterations,
+        replicated_texts,
         num_masks,
         rng,
         pipeline.tokenizer,
         pipeline.device,
     )
 
-    #print("Substitutions after masking:", substitutions.shape) #1, 189,4 .. but why? It is the first step!
-    max_masks = masked_token_tensor.shape[1] # number of tokens in the sentence, if masking fraction is 100%
+    seq_len = masked_token_tensor.shape[1]
+    max_masks = substitutions.shape[1]
+    tokens_per_uturn = masked_token_tensor.view(num_texts, sequential_iterations, seq_len)
+    substitutions = substitutions.view(num_texts, sequential_iterations, max_masks, 4)
+    # attention is identical across the u-turn replicates of a text.
+    step_att = attention_tensor.view(num_texts, sequential_iterations, seq_len)[:, 0].contiguous()
 
-    # ✅ PREALLOCATE [U, M, 4]
-    #all_substitutions = substitutions #torch.full(
-        #(sequential_iterations, max_masks, 4),
-        #-1,
-        #dtype=torch.long,
-        #device=pipeline.device,
-    #)
+    mask_id = pipeline.tokenizer.mask_token_id
+    step_tokens = tokens_per_uturn[:, 0].contiguous() # already masked at the u-turn-0 positions
 
-    #all_substitutions[0][:substitutions.shape[1]] = substitutions  # store initial masking step, leave rest as -1
-
-    #print("all_substitutions shape:", all_substitutions.shape)
     for uturn in range(sequential_iterations):
         # For each uturn, we need to unmask the previously masked tokens, fill in the substitutions, and then re-mask for the next uturn.
-
-        step_tokens = masked_token_tensor[uturn, :].unsqueeze(0)
-        step_att = attention_tensor[uturn, :].unsqueeze(0)
-        step_subs = substitutions[uturn, :].unsqueeze(0) # [1, M, 4], filled with -1s at start, except for initial masking step, where it is filled with masked positions and original token ids.
+        step_subs = substitutions[:, uturn].contiguous() # [num_texts, M, 4], masked positions and pre-mask token ids filled in, final ids/steps still -1.
 
         # --- unmask ---
         if pipeline.model_name.startswith("Dream-org/Dream"):
-            print("Using Dream unmasking...")
             unmasked_tokens, step_subs = _unmask_dispatch(
                 step_tokens, # Masked token tensor, re-written at the end of previous u-turn
-                step_att, # Attention tensor, re-written at the end of previous u-turn
-                step_subs, # Substitutions for this step, shape [1, M, 4], contain the mask token positions and token ids before masking
+                step_att,
+                step_subs,
                 pipeline,
                 rng=None,
             )
@@ -452,29 +468,50 @@ def mask_unmask_monte_sequential(
                     substitution_step=step,
                     T=T,
                 )
-                
-            # Given the filled substitution tensor, update masked_token_tensor with the unmasked token ids
+
+            # Given the filled substitution tensor, update the token tensor with the unmasked token ids
             apply_substitutions(step_tokens, step_subs, state="final")
+            unmasked_tokens = step_tokens
 
-        # ✅ Add the completed substitution tensor from the current step to the history. This concludes the unmasking and we move on to mask again
-        substitutions[uturn][:step_subs.shape[1]] = step_subs 
+        substitutions[:, uturn] = step_subs # This concludes the unmasking and we move on to mask again
 
-        masked_token_tensor[uturn, :] = unmasked_tokens.squeeze(0) # Where the token id is not the mask id
-        substitutions[uturn, :] = step_subs.squeeze(0)
-
-        # --- re-mask masked_token_tensor for next u-turn and prepare substitution tensor ---
-        if uturn < sequential_iterations-1:
-            masked_token_tensor[uturn+1] = unmasked_tokens #.squeeze(0)
-            subs_mask = substitutions[uturn+1,:,0] > -1 # Mask new masked token tensor at correct positions
-            masked_token_tensor[uturn+1,substitutions[uturn+1,subs_mask,0]] = pipeline.tokenizer.mask_token_id
-            substitutions[uturn+1,subs_mask,1] = masked_token_tensor[0,substitutions[uturn+1,subs_mask,0]] # Fill 'original' token ids in substitutions
-            # So substitutions[uturns+1] now only has information about which were the original token ids and at which positions are these
-
-    #print("shape of substitutions after mask_unmask_monte_sequential:", all_substitutions.shape) # torch.Size([10, 189, 4])
-
-    # Remove unnecessary lines: adjust all_substitutions[1] according to the actual maximum number of masks across each uturn step, deleting lines in which all values are -1
+        # --- re-mask for the next u-turn ---
+        if uturn < sequential_iterations - 1:
+            next_subs = substitutions[:, uturn + 1]
+            step_tokens = unmasked_tokens.clone()
+            for text_ind in range(num_texts):
+                masked = next_subs[text_ind, :, 0] >= 0
+                positions = next_subs[text_ind, masked, 0]
+                next_subs[text_ind, masked, 1] = step_tokens[text_ind, positions] # record the pre-mask token ids from the current chain state
+                step_tokens[text_ind, positions] = mask_id
 
     return substitutions
+
+
+def mask_unmask_monte_sequential(
+    text: str,
+    sequential_iterations: int,
+    pipeline,
+    num_masks,
+    rng,
+    *,
+    T: float = 1.0,
+):
+    """
+    Performs sequential mask-unmask on a single text, for a given number of iterations.
+    Convenience wrapper around mask_unmask_monte_sequential_batch.
+
+    Returns:
+        torch.LongTensor: Substitution record of shape [num_uturns, max_masks, 4].
+    """
+    return mask_unmask_monte_sequential_batch(
+        [text],
+        sequential_iterations,
+        pipeline,
+        num_masks,
+        rng,
+        T=T,
+    )[0]
 
 
 def reconstruct_sequential_tensor_texts(initial_text, substitutions, pipeline):
