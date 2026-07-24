@@ -2,7 +2,7 @@ import types
 import torch
 from typing import Optional, Union, Set, Callable
 import transformers
-from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from dream_model.generation_utils import (
     DreamGenerationConfig,
     DreamModelOutput,
@@ -10,7 +10,7 @@ from dream_model.generation_utils import (
 )
 from dream_model.modeling_dream import DreamModel
 from dklib.banned_tokens import compute_banned_token_ids
-
+from dklib.llm_loading import load_llm
 
 # --------------------------------------------------
 # Custom Dream Model
@@ -148,11 +148,12 @@ class CustomUnmasker:
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
         # Load model
-        self.model = AutoModel.from_pretrained(
+        self.model = load_llm(
             model_path,
+            device=device,
+            eval_mode=False,
             torch_dtype=dtype,
-            trust_remote_code=True
-        ).to(device)
+        )
 
         self.model_name = model_name
         
