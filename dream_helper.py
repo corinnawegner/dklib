@@ -148,10 +148,13 @@ class CustomUnmasker:
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
         # Load model
+        # eval mode: dropout off and no autograd bookkeeping during inference.
+        # (attention_dropout defaults to 0.0 for Dream, so this does not change
+        # the sampling distribution.)
         self.model = load_llm(
             model_path,
             device=device,
-            eval_mode=False,
+            eval_mode=True,
             torch_dtype=dtype,
         )
 
@@ -259,6 +262,32 @@ def compute_first_token_banned_ids(tokenizer: PreTrainedTokenizerBase) -> torch.
 
     banned_ids = torch.tensor(sorted(banned), dtype=torch.long)
     print(f"First-token capitalization: banned {len(banned_ids)} tokens.")
+    return banned_ids
+
+
+def compute_final_token_banned_ids(tokenizer: PreTrainedTokenizerBase) -> torch.LongTensor:
+    """Return token ids that may NOT be the final token of a sequence.
+
+    A token is allowed at the last position only if its decoded text ends a
+    sentence: the last non-space character is '.', '!' or '?', optionally
+    followed by a single closing quote/bracket. Used to keep fixed-length
+    unconditional samples from ending mid-sentence.
+    """
+    banned: Set[int] = set()
+    enders = ".!?"
+    closers = "\"'”’)»]"
+    for token_id in range(len(tokenizer)):
+        s = tokenizer.decode([token_id], skip_special_tokens=False).strip()
+        ok = False
+        if s:
+            if s[-1] in enders:
+                ok = True
+            elif s[-1] in closers and len(s) >= 2 and s[-2] in enders:
+                ok = True
+        if not ok:
+            banned.add(token_id)
+    banned_ids = torch.tensor(sorted(banned), dtype=torch.long)
+    print(f"Sentence-end constraint: banned {len(banned_ids)} tokens at the final position.")
     return banned_ids
 
 
@@ -394,6 +423,155 @@ def _validate_and_resample_grammar(
     return final_tokens
 
 
+def _ensure_ban_caches(pipeline):
+    """Compute (once) and return the cached banned-token id tensors.
+
+    Returns:
+        banned_ids (torch.LongTensor): ids banned at every position.
+        first_banned (Optional[torch.LongTensor]): ids banned at position 0
+            (capitalization constraint), or None if the constraint is off.
+    """
+    tok = pipeline.tokenizer
+    if not hasattr(pipeline, "_banned_ids"):
+        pipeline._banned_ids = compute_banned_token_ids(
+            tok,
+            ban_numbers=getattr(pipeline, "_ban_numbers", True),
+            ban_symbols=getattr(pipeline, "_ban_symbols", True),
+            ban_unicode_artifacts=getattr(pipeline, "_ban_unicode_artifacts", True),
+            ban_special_tokens=getattr(pipeline, "_ban_special_tokens", True),
+            ban_non_alpha=getattr(pipeline, "_ban_non_alpha", False),
+            ban_repeated_punctuation=getattr(pipeline, "_ban_repeated_punctuation", False),
+            ban_crosslingual=getattr(pipeline, "_ban_crosslingual", False),
+            require_real_word=getattr(pipeline, "_require_real_word", False),
+            strict_real_word=getattr(pipeline, "_strict_real_word", False),
+        )
+
+    first_banned = None
+    if getattr(pipeline, "_require_capitalized_start", True):
+        if not hasattr(pipeline, "_first_token_banned_ids"):
+            pipeline._first_token_banned_ids = compute_first_token_banned_ids(tok)
+        first_banned = pipeline._first_token_banned_ids
+
+    return pipeline._banned_ids, first_banned
+
+
+def unmask_batch_dream_fast(
+    masked_token_tensor: torch.LongTensor,         # [num_runs, seq_len]
+    attention_tensor: torch.Tensor,                # [num_runs, seq_len]
+    substitutions: torch.LongTensor,               # [num_runs, max_masks, 4]
+    pipeline,
+):
+    """Unmask with Dream using one forward pass per revealed token.
+
+    The legacy path calls diffusion_generate_infilling with steps = seq_len,
+    i.e. one full forward pass per sequence position, even though only the
+    masked positions can change. In the fine-step limit the 'origin'
+    algorithm reveals masked tokens one at a time in uniformly random order,
+    each sampled from the model's conditionals given the current context.
+    This function samples from that limit directly: exactly
+    max_i(num_masked_i) forward passes, each revealing one token per
+    sequence (sampled with the same temperature/top_p and token bans as the
+    legacy path).
+
+    substitutions is filled in place (columns 2 and 3); column 3 records the
+    reveal order 0..M-1 instead of a diffusion step index.
+
+    Returns:
+        (unmasked_token_tensor, substitutions)
+    """
+    tok = pipeline.tokenizer
+    model = pipeline.model
+    device = masked_token_tensor.device
+
+    banned_ids, first_banned = _ensure_ban_caches(pipeline)
+    banned_ids = banned_ids.to(device)
+    if first_banned is not None:
+        first_banned = first_banned.to(device)
+
+    # Optional: constrain the final token of each sequence to end a sentence
+    # (off by default; enable with pipeline._require_sentence_end = True).
+    final_banned = None
+    if getattr(pipeline, "_require_sentence_end", False):
+        if not hasattr(pipeline, "_final_token_banned_ids"):
+            pipeline._final_token_banned_ids = compute_final_token_banned_ids(tok)
+        final_banned = pipeline._final_token_banned_ids.to(device)
+
+    # Sampling is always temperature 1.0 with no nucleus truncation: the
+    # u-turn kernel must draw from the model's full conditional so that
+    # detailed balance holds w.r.t. the model distribution.
+    temperature = getattr(pipeline, "_dream_temperature", 1.0)
+    top_p = getattr(pipeline, "_dream_top_p", 1.0)
+
+    x = masked_token_tensor.clone()
+    x[x < 0] = tok.mask_token_id
+    vocab_limit = len(tok)
+
+    # Same attention handling as DreamGenerationMixin._sample.
+    if attention_tensor is not None and torch.any(attention_tensor == 0.0):
+        att = attention_tensor
+        tok_idx = att.long().cumsum(-1) - 1
+        tok_idx.masked_fill_(att == 0, 1)
+        attn_mask = torch.logical_and(
+            att.unsqueeze(1).unsqueeze(-2),
+            att.unsqueeze(1).unsqueeze(-1),
+        )
+    else:
+        tok_idx = None
+        attn_mask = "full"
+
+    positions = substitutions[:, :, 0]                       # [B, M]
+    remaining = (positions >= 0) & (substitutions[:, :, 2] == -1)
+    if not remaining.any():
+        return x, substitutions
+    n_steps = int(remaining.sum(dim=1).max().item())
+    batch_arange = torch.arange(x.shape[0], device=device)
+    if attention_tensor is not None:
+        last_pos = attention_tensor.long().sum(dim=-1) - 1   # [B]
+    else:
+        last_pos = torch.full((x.shape[0],), x.shape[1] - 1,
+                              dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        for step in range(n_steps):
+            active = remaining.any(dim=1)                    # [B]
+            logits = model(x, attn_mask, tok_idx).logits
+            # Dream's head predicts the next position: shift like _sample does.
+            logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+            # pick one remaining masked slot per active sequence, uniformly.
+            r = torch.rand(remaining.shape, device=device)
+            r = r.masked_fill(~remaining, -1.0)
+            sel = r.argmax(dim=1)                            # [B]
+            rows = batch_arange[active]
+            sel_slots = sel[rows]
+            sel_pos = positions[rows, sel_slots]
+
+            row_logits = logits[rows, sel_pos]               # [A, vocab]
+            # the lm_head can be padded beyond the tokenizer's vocab; those
+            # ids are untrained and undecodable — never sample them.
+            if row_logits.shape[-1] > vocab_limit:
+                row_logits[:, vocab_limit:] = float("-inf")
+            if banned_ids.numel() > 0:
+                row_logits[:, banned_ids] = float("-inf")
+            if first_banned is not None and first_banned.numel() > 0:
+                first_rows = torch.nonzero(sel_pos == 0).squeeze(-1)
+                if first_rows.numel() > 0:
+                    row_logits[first_rows.unsqueeze(1), first_banned.unsqueeze(0)] = float("-inf")
+            if final_banned is not None and final_banned.numel() > 0:
+                end_rows = torch.nonzero(sel_pos == last_pos[rows]).squeeze(-1)
+                if end_rows.numel() > 0:
+                    row_logits[end_rows.unsqueeze(1), final_banned.unsqueeze(0)] = float("-inf")
+
+            _, new_ids = sample_tokens(row_logits, temperature=temperature, top_p=top_p)
+
+            x[rows, sel_pos] = new_ids
+            substitutions[rows, sel_slots, 2] = new_ids
+            substitutions[rows, sel_slots, 3] = step
+            remaining[rows, sel_slots] = False
+
+    return x, substitutions
+
+
 def unmask_batch_dream(
     masked_token_tensor: torch.LongTensor,         # [num_runs, seq_len]
     attention_tensor: torch.Tensor,                # [num_runs, seq_len]
@@ -413,6 +591,17 @@ def unmask_batch_dream(
         masked_token_tensor: Updated in-place with unmasked tokens
         substitutions_new: [B, M, 4] new substitutions after unmasking
     """
+    # Fast path: one forward pass per revealed token instead of one per
+    # sequence position. Grammar validation needs the diffusion history, so
+    # it stays on the legacy path; set pipeline._dream_legacy_diffusion=True
+    # to force the old behaviour.
+    if not getattr(pipeline, "_dream_legacy_diffusion", False) and not getattr(
+        pipeline, "_validate_grammar", False
+    ):
+        return unmask_batch_dream_fast(
+            masked_token_tensor, attention_tensor, substitutions_old, pipeline
+        )
+
     tok = pipeline.tokenizer
     model = pipeline.model
     device = masked_token_tensor.device
@@ -422,30 +611,19 @@ def unmask_batch_dream(
     # - Obtain the masked token tensor after unmasking
     # - Update the substitution tensor with the unmasking step! The final token will be done later anyway with the information from the masked_token_tensor
 
-    # compute banned token IDs ONCE — read constraints from pipeline attributes
-    if not hasattr(pipeline, "_banned_ids"):
-        pipeline._banned_ids = compute_banned_token_ids(
-            tok,
-            ban_numbers=getattr(pipeline, "_ban_numbers", True),
-            ban_symbols=getattr(pipeline, "_ban_symbols", True),
-            ban_unicode_artifacts=getattr(pipeline, "_ban_unicode_artifacts", True),
-            ban_special_tokens=getattr(pipeline, "_ban_special_tokens", True),
-            ban_non_alpha=getattr(pipeline, "_ban_non_alpha", False),
-            ban_repeated_punctuation=getattr(pipeline, "_ban_repeated_punctuation", False),
-            ban_crosslingual=getattr(pipeline, "_ban_crosslingual", False),
-            require_real_word=getattr(pipeline, "_require_real_word", False),
-            strict_real_word=getattr(pipeline, "_strict_real_word", False),
-        )
+    banned_ids, first_banned = _ensure_ban_caches(pipeline)
+    _base_hook = make_ban_tokens_logits_hook(banned_ids)
+    _vocab_limit = len(tok)
 
-    banned_ids = pipeline._banned_ids
-    logits_hook = make_ban_tokens_logits_hook(banned_ids)
+    def logits_hook(step, x_t, logits):
+        # never sample padded lm_head ids beyond the tokenizer's vocab
+        if logits.shape[-1] > _vocab_limit:
+            logits[..., _vocab_limit:] = float("-inf")
+        return _base_hook(step, x_t, logits)
 
     # Optionally enforce that the first token starts with an uppercase ASCII letter.
     generation_logits_hook_func = logits_hook
-    if getattr(pipeline, "_require_capitalized_start", True):
-        if not hasattr(pipeline, "_first_token_banned_ids"):
-            pipeline._first_token_banned_ids = compute_first_token_banned_ids(tok)
-        first_banned = pipeline._first_token_banned_ids
+    if first_banned is not None:
         first_hook = make_first_token_capitalized_logits_hook(first_banned)
 
         def _combined_hook(step, x_t, logits):
@@ -472,7 +650,7 @@ def unmask_batch_dream(
         return_dict_in_generate=True,
         steps=masked_token_tensor.shape[1],#max(1, int(mask_frac * seq_len)),  # ensure at least 1 step
         temperature=1.0,
-        top_p=0.95,
+        top_p=1.0,
         alg="origin",
         alg_temp=0.0,
         generation_logits_hook_func=generation_logits_hook_func,

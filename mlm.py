@@ -211,7 +211,8 @@ def unmask_batch(
         top_token_ids (torch.LongTensor): Tensor to store top token IDs (optional).
         top_token_probs (torch.Tensor): Tensor to store top token probabilities (optional).
     """
-    logits = pipeline.model.forward(masked_token_tensor, attention_tensor)["logits"]
+    with torch.no_grad():
+        logits = pipeline.model.forward(masked_token_tensor, attention_tensor)["logits"]
     batch_size = masked_token_tensor.shape[0]
     illegal_tokens = torch.tensor([], dtype=torch.int64, device=masked_token_tensor.device)
     if(dont_predict_special_tokens):

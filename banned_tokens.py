@@ -148,6 +148,17 @@ def compute_banned_token_ids(
             banned_ids.add(token_id)
             continue
 
+        # Always ban whitespace anomalies: tabs and exotic unicode whitespace
+        # (non-breaking space \xa0, thin spaces, ...), runs of 2+ spaces, and
+        # pure-whitespace tokens. A single leading space (the normal BPE word
+        # prefix) stays allowed.
+        if any(c.isspace() and c != " " for c in token_str):
+            banned_ids.add(token_id)
+            continue
+        if "  " in token_str or (token_str != "" and token_str.strip() == ""):
+            banned_ids.add(token_id)
+            continue
+
         # ban_numbers
         if ban_numbers and any(c.isdigit() for c in token_str):
             banned_ids.add(token_id)
